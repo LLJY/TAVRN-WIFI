@@ -1,0 +1,28 @@
+# Build artifacts
+*.o
+*.d
+*.a
+*.so
+*.dylib
+
+# Editor/IDE
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.kate-swp
+.clangd/
+compile_commands.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+
+# Temporary files
+*.tmp
+*.bak

@@ -1,0 +1,28 @@
+build_lib(
+  LIBNAME tavrn
+  SOURCE_FILES
+    helper/tavrn-helper.cc
+    model/tavrn-dpd.cc
+    model/tavrn-gtt.cc
+    model/tavrn-id-cache.cc
+    model/tavrn-neighbor.cc
+    model/tavrn-packet.cc
+    model/tavrn-routing-protocol.cc
+    model/tavrn-rqueue.cc
+    model/tavrn-rtable.cc
+  HEADER_FILES
+    helper/tavrn-helper.h
+    model/tavrn-dpd.h
+    model/tavrn-gtt.h
+    model/tavrn-id-cache.h
+    model/tavrn-neighbor.h
+    model/tavrn-packet.h
+    model/tavrn-routing-protocol.h
+    model/tavrn-rqueue.h
+    model/tavrn-rtable.h
+  LIBRARIES_TO_LINK
+    ${libinternet}
+    ${libwifi}
+  TEST_SOURCES
+    test/tavrn-test-suite.cc
+)
