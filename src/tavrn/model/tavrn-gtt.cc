@@ -59,9 +59,6 @@ GlobalTopologyTable::AddOrUpdateEntry(Ipv4Address addr, uint32_t seqNo, uint16_t
     NS_LOG_FUNCTION(this << addr << seqNo << hopCount);
 
     Time now = Simulator::Now();
-    Time softOffset = Seconds(m_defaultTtl.GetSeconds() * m_softExpiryThreshold);
-    Time newSoftExpiry = now + softOffset;
-    Time newTtlExpiry = now + m_defaultTtl;
 
     auto it = m_entries.find(addr);
     if (it != m_entries.end())
@@ -74,10 +71,17 @@ GlobalTopologyTable::AddOrUpdateEntry(Ipv4Address addr, uint32_t seqNo, uint16_t
             return false;
         }
 
-        NS_LOG_LOGIC("Updating GTT entry for " << addr << " seqNo " << seqNo);
+        // Use per-node TTL if set, otherwise table default
+        Time effectiveTtl = (it->second.perNodeTtl.IsStrictlyPositive())
+                                ? it->second.perNodeTtl
+                                : m_defaultTtl;
+        Time softOffset = Seconds(effectiveTtl.GetSeconds() * m_softExpiryThreshold);
+
+        NS_LOG_LOGIC("Updating GTT entry for " << addr << " seqNo " << seqNo
+                     << " effectiveTtl=" << effectiveTtl.As(Time::S));
         it->second.lastSeen = now;
-        it->second.ttlExpiry = newTtlExpiry;
-        it->second.softExpiry = newSoftExpiry;
+        it->second.ttlExpiry = now + effectiveTtl;
+        it->second.softExpiry = now + softOffset;
         it->second.seqNo = seqNo;
         it->second.hopCount = hopCount;
 
@@ -93,7 +97,11 @@ GlobalTopologyTable::AddOrUpdateEntry(Ipv4Address addr, uint32_t seqNo, uint16_t
         return true;
     }
 
-    // New entry
+    // New entry — uses table default TTL (perNodeTtl starts at 0 = "use default")
+    Time softOffset = Seconds(m_defaultTtl.GetSeconds() * m_softExpiryThreshold);
+    Time newSoftExpiry = now + softOffset;
+    Time newTtlExpiry = now + m_defaultTtl;
+
     NS_LOG_LOGIC("Adding new GTT entry for " << addr << " seqNo " << seqNo);
     GttEntry entry(addr, now, newTtlExpiry, newSoftExpiry, seqNo, hopCount);
     m_entries.insert(std::make_pair(addr, entry));
@@ -282,10 +290,15 @@ GlobalTopologyTable::RefreshEntry(Ipv4Address addr, uint32_t seqNo)
         return;
     }
 
+    // Use per-node TTL if set, otherwise table default
+    Time effectiveTtl = (it->second.perNodeTtl.IsStrictlyPositive())
+                            ? it->second.perNodeTtl
+                            : m_defaultTtl;
+
     Time now = Simulator::Now();
-    Time softOffset = Seconds(m_defaultTtl.GetSeconds() * m_softExpiryThreshold);
+    Time softOffset = Seconds(effectiveTtl.GetSeconds() * m_softExpiryThreshold);
     it->second.lastSeen = now;
-    it->second.ttlExpiry = now + m_defaultTtl;
+    it->second.ttlExpiry = now + effectiveTtl;
     it->second.softExpiry = now + softOffset;
     it->second.seqNo = seqNo;
 
@@ -301,8 +314,9 @@ GlobalTopologyTable::RefreshEntry(Ipv4Address addr, uint32_t seqNo)
         m_sizeChangeTrace(NodeCount());
     }
 
-    NS_LOG_LOGIC("Refreshed GTT entry for " << addr << " new ttlExpiry="
-                                             << it->second.ttlExpiry.As(Time::S));
+    NS_LOG_LOGIC("Refreshed GTT entry for " << addr << " effectiveTtl="
+                 << effectiveTtl.As(Time::S) << " new ttlExpiry="
+                 << it->second.ttlExpiry.As(Time::S));
 }
 
 bool
@@ -414,6 +428,109 @@ GlobalTopologyTable::MergeEntry(const GttEntry& entry)
             m_nodeJoinTrace(entry.nodeAddr);
         }
         m_sizeChangeTrace(NodeCount());
+    }
+}
+
+// ===========================================================================
+//  Per-node adaptive TTL (Tier 2)
+// ===========================================================================
+
+void
+GlobalTopologyTable::SetPerNodeTtl(Ipv4Address addr, Time perNodeTtl)
+{
+    NS_LOG_FUNCTION(this << addr << perNodeTtl.As(Time::S));
+
+    auto it = m_entries.find(addr);
+    if (it == m_entries.end())
+    {
+        NS_LOG_LOGIC("SetPerNodeTtl: " << addr << " not found, ignoring");
+        return;
+    }
+
+    // Clamp to table default (per-node TTL is always <= global TTL)
+    Time clamped = (perNodeTtl.IsStrictlyPositive() && perNodeTtl < m_defaultTtl)
+                       ? perNodeTtl
+                       : Time(0); // Time(0) = use default
+
+    it->second.perNodeTtl = clamped;
+
+    // Immediately recalculate expiry based on new effective TTL
+    Time effectiveTtl = clamped.IsStrictlyPositive() ? clamped : m_defaultTtl;
+    Time softOffset = Seconds(effectiveTtl.GetSeconds() * m_softExpiryThreshold);
+    Time now = Simulator::Now();
+    it->second.ttlExpiry = it->second.lastSeen + effectiveTtl;
+    it->second.softExpiry = it->second.lastSeen + softOffset;
+
+    NS_LOG_LOGIC("SetPerNodeTtl for " << addr << ": perNodeTtl="
+                 << (clamped.IsStrictlyPositive() ? clamped.As(Time::S) : m_defaultTtl.As(Time::S))
+                 << " ttlExpiry=" << it->second.ttlExpiry.As(Time::S));
+}
+
+void
+GlobalTopologyTable::GrowPerNodeTtl(Ipv4Address addr, double alpha)
+{
+    NS_LOG_FUNCTION(this << addr << alpha);
+
+    auto it = m_entries.find(addr);
+    if (it == m_entries.end() || it->second.departed)
+    {
+        return;
+    }
+
+    if (!it->second.perNodeTtl.IsStrictlyPositive())
+    {
+        // Already at table default — nothing to grow
+        return;
+    }
+
+    // EMA: new = alpha * old + (1 - alpha) * target
+    double oldSec = it->second.perNodeTtl.GetSeconds();
+    double targetSec = m_defaultTtl.GetSeconds();
+    double newSec = alpha * oldSec + (1.0 - alpha) * targetSec;
+
+    // Snap to default if within 5%
+    if (newSec >= targetSec * 0.95)
+    {
+        it->second.perNodeTtl = Time(0); // revert to table default
+        NS_LOG_LOGIC("GrowPerNodeTtl: " << addr << " snapped to default ("
+                     << targetSec << "s)");
+    }
+    else
+    {
+        it->second.perNodeTtl = Seconds(newSec);
+        NS_LOG_LOGIC("GrowPerNodeTtl: " << addr << " grew to " << newSec << "s");
+    }
+}
+
+void
+GlobalTopologyTable::ClampAllPerNodeTtls(Time ceiling)
+{
+    NS_LOG_FUNCTION(this << ceiling.As(Time::S));
+
+    Time now = Simulator::Now();
+
+    for (auto& pair : m_entries)
+    {
+        GttEntry& e = pair.second;
+        if (e.departed)
+        {
+            continue;
+        }
+
+        // If entry uses the table default (perNodeTtl == 0) and default > ceiling,
+        // set perNodeTtl to ceiling explicitly
+        Time effectiveTtl = e.perNodeTtl.IsStrictlyPositive() ? e.perNodeTtl : m_defaultTtl;
+        if (effectiveTtl > ceiling)
+        {
+            e.perNodeTtl = ceiling;
+            // Recalculate expiry from lastSeen
+            Time softOffset = Seconds(ceiling.GetSeconds() * m_softExpiryThreshold);
+            e.ttlExpiry = e.lastSeen + ceiling;
+            e.softExpiry = e.lastSeen + softOffset;
+
+            NS_LOG_LOGIC("ClampAllPerNodeTtls: " << pair.first << " clamped to "
+                         << ceiling.As(Time::S));
+        }
     }
 }
 

@@ -211,6 +211,11 @@ RoutingProtocol::RoutingProtocol()
       m_nextHopWait(MilliSeconds(50)),
       m_blackListTimeout(Time(m_rreqRetries * Time(2 * m_netDiameter * m_nodeTraversalTime))),
       m_gttTtl(Seconds(300)),
+      m_enableAdaptiveGttTtl(false),
+      m_gttTtlMin(Seconds(60)),
+      m_gttTtlMax(Seconds(300)),
+      m_gttAlpha(0.7),
+      m_lastNeighborCount(0),
       m_softExpiryThreshold(0.5),
       m_enablePeriodicHello(true),
       m_helloInterval(Seconds(150)),
@@ -280,8 +285,8 @@ RoutingProtocol::GetTypeId()
                           MakeUintegerChecker<uint16_t>())
             .AddAttribute("ActiveRouteTimeout",
                           "Period of time during which a route is considered valid. "
-                          "Set to 2x GttTtl: routes outlive GTT entries so stale GTT "
-                          "entries prefer vectored routing before falling back to floods.",
+                          "Derived: 2x current GttTtl. With adaptive TTL, starts at "
+                          "2x GttTtlMin and grows as the global TTL grows.",
                           TimeValue(Seconds(600)),
                           MakeTimeAccessor(&RoutingProtocol::m_activeRouteTimeout),
                           MakeTimeChecker())
@@ -317,10 +322,34 @@ RoutingProtocol::GetTypeId()
                 MakeBooleanAccessor(&RoutingProtocol::m_gratuitousReply),
                 MakeBooleanChecker())
             .AddAttribute("GttTtl",
-                          "GTT entry default time-to-live.",
+                          "GTT entry time-to-live. With adaptive TTL, this is the "
+                          "initial value (= GttTtlMin). Without adaptive TTL, static.",
                           TimeValue(Seconds(300)),
                           MakeTimeAccessor(&RoutingProtocol::m_gttTtl),
                           MakeTimeChecker())
+            .AddAttribute("EnableAdaptiveGttTtl",
+                          "Whether the global GTT TTL adapts: starts at GttTtlMin, "
+                          "grows toward GttTtlMax via EMA as topology stabilizes, "
+                          "resets to GttTtlMin on neighbor gain/loss.",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&RoutingProtocol::m_enableAdaptiveGttTtl),
+                          MakeBooleanChecker())
+            .AddAttribute("GttTtlMin",
+                          "Minimum (fast-mode) GTT TTL during bootstrap/churn.",
+                          TimeValue(Seconds(60)),
+                          MakeTimeAccessor(&RoutingProtocol::m_gttTtlMin),
+                          MakeTimeChecker())
+            .AddAttribute("GttTtlMax",
+                          "Maximum (steady-state) GTT TTL ceiling.",
+                          TimeValue(Seconds(300)),
+                          MakeTimeAccessor(&RoutingProtocol::m_gttTtlMax),
+                          MakeTimeChecker())
+            .AddAttribute("GttAlpha",
+                          "EMA smoothing factor for adaptive TTL growth. "
+                          "Higher = slower growth. Range (0, 1).",
+                          DoubleValue(0.7),
+                          MakeDoubleAccessor(&RoutingProtocol::m_gttAlpha),
+                          MakeDoubleChecker<double>(0.01, 0.99))
             .AddAttribute("SoftExpiryThreshold",
                           "Fraction of GTT-TTL at which soft expiry triggers freshness request.",
                           DoubleValue(0.5),
@@ -334,7 +363,8 @@ RoutingProtocol::GetTypeId()
                           MakeBooleanChecker())
             .AddAttribute("HelloInterval",
                           "Interval between periodic HELLO broadcasts. "
-                          "Default: 0.5 * GttTtl (soft-expiry duty cycle).",
+                          "Derived: 0.5 * current GttTtl. With adaptive TTL, "
+                          "starts at 0.5 * GttTtlMin and grows automatically.",
                           TimeValue(Seconds(150)),
                           MakeTimeAccessor(&RoutingProtocol::m_helloInterval),
                           MakeTimeChecker())
@@ -497,8 +527,15 @@ RoutingProtocol::DoInitialize()
     m_queue.SetQueueTimeout(m_maxQueueTime);
 
     // Sync GTT parameters with attributes (in case they were changed via Config)
-    m_gtt.SetDefaultTtl(m_gttTtl);
     m_gtt.SetSoftExpiryThreshold(m_softExpiryThreshold);
+
+    // Initialize adaptive GTT TTL: start at TTL_min, derive all timers
+    if (m_enableAdaptiveGttTtl)
+    {
+        m_gttTtl = m_gttTtlMin;
+        m_lastNeighborCount = 0;
+    }
+    RecalcDerivedTimers();
 
     if (m_enablePeriodicHello)
     {
@@ -2993,15 +3030,31 @@ RoutingProtocol::RecvTcUpdate(Ptr<Packet> p, Ipv4Address src)
         if (!m_gtt.LookupEntry(subject, existing))
         {
             m_gtt.AddOrUpdateEntry(subject, 0, 0);
+            // Tier 2: New remote node gets fast-tracked with TTL_min
+            if (m_enableAdaptiveGttTtl)
+            {
+                m_gtt.SetPerNodeTtl(subject, m_gttTtlMin);
+            }
         }
         else
         {
             m_gtt.RefreshEntry(subject, existing.seqNo);
+            // Tier 2: If node was departed and got resurrected, fast-track it
+            if (m_enableAdaptiveGttTtl && existing.departed)
+            {
+                m_gtt.SetPerNodeTtl(subject, m_gttTtlMin);
+            }
         }
     }
     else // NODE_LEAVE
     {
         m_gtt.MarkDeparted(subject);
+
+        // Tier 2 adaptive TTL: if the subject is a remote (non-neighbor) node,
+        // DON'T reset the global TTL — only snap that entry's per-node TTL to
+        // TTL_min for surgical fast-verification if it's later resurrected.
+        // (If it's a direct neighbor, the global TTL reset will be triggered
+        // by the neighbor count change detection in GttMaintenanceTimerExpire.)
     }
 
     // Fire convergence trace
@@ -3497,11 +3550,120 @@ RoutingProtocol::GttMaintenanceTimerExpire()
         m_gtt.RefreshEntry(myAddr, m_seqNo);
     }
 
+    // --- Adaptive GTT TTL: Tier 1 (Global) ---
+    if (m_enableAdaptiveGttTtl)
+    {
+        // Detect neighbor count change since last cycle
+        uint32_t currentNeighborCount = 0;
+        {
+            // Count active neighbors via the neighbor table's list
+            // (Neighbors doesn't expose a count method, so we use m_nb.IsNeighbor
+            // iteratively — but we already track the snapshot)
+            auto nodes = m_gtt.EnumerateNodes();
+            for (const auto& addr : nodes)
+            {
+                if (m_nb.IsNeighbor(addr))
+                {
+                    ++currentNeighborCount;
+                }
+            }
+        }
+
+        bool neighborChanged = (currentNeighborCount != m_lastNeighborCount);
+        m_lastNeighborCount = currentNeighborCount;
+
+        if (neighborChanged)
+        {
+            // Structural change — reset global TTL to fast mode
+            ResetGlobalGttTtl();
+            NS_LOG_DEBUG("Adaptive GTT: neighbor change detected ("
+                         << currentNeighborCount << " neighbors). "
+                         << "Global TTL reset to " << m_gttTtl.As(Time::S));
+        }
+        else
+        {
+            // No neighbor change — grow global TTL toward max via EMA
+            double oldSec = m_gttTtl.GetSeconds();
+            double maxSec = m_gttTtlMax.GetSeconds();
+            double newSec = m_gttAlpha * oldSec + (1.0 - m_gttAlpha) * maxSec;
+
+            if (newSec >= maxSec * 0.95)
+            {
+                newSec = maxSec; // snap to ceiling
+            }
+
+            if (newSec != oldSec)
+            {
+                m_gttTtl = Seconds(newSec);
+                RecalcDerivedTimers();
+                NS_LOG_DEBUG("Adaptive GTT: stable cycle. Global TTL grew to "
+                             << m_gttTtl.As(Time::S));
+            }
+        }
+
+        // --- Tier 2: Grow per-node TTLs toward current global TTL ---
+        auto allNodes = m_gtt.EnumerateNodes();
+        for (const auto& addr : allNodes)
+        {
+            m_gtt.GrowPerNodeTtl(addr, m_gttAlpha);
+        }
+    }
+
     CheckGttExpiry();
 
     // Reschedule: check proportionally to TTL to preserve radio silence in long-TTL networks
     Time interval = std::max(Seconds(1), m_gttTtl / 12);
     m_gttMaintenanceTimer.Schedule(interval);
+}
+
+// ============================================================================
+// ResetGlobalGttTtl — snap global TTL to min on neighbor topology change
+// ============================================================================
+
+void
+RoutingProtocol::ResetGlobalGttTtl()
+{
+    NS_LOG_FUNCTION(this);
+
+    m_gttTtl = m_gttTtlMin;
+
+    // Clamp all per-node TTLs to be <= new global TTL BEFORE updating
+    // the GTT default TTL (RecalcDerivedTimers calls SetDefaultTtl),
+    // so entries with perNodeTtl == 0 are correctly evaluated against
+    // the old default before it changes.
+    m_gtt.ClampAllPerNodeTtls(m_gttTtlMin);
+
+    RecalcDerivedTimers();
+}
+
+// ============================================================================
+// RecalcDerivedTimers — update all timers derived from current m_gttTtl
+// ============================================================================
+
+void
+RoutingProtocol::RecalcDerivedTimers()
+{
+    NS_LOG_FUNCTION(this << m_gttTtl.As(Time::S));
+
+    // Sync GTT's default TTL (used for new entries and entries at table default)
+    m_gtt.SetDefaultTtl(m_gttTtl);
+
+    // HelloInterval = 0.5 * GttTtl
+    if (m_enablePeriodicHello)
+    {
+        m_helloInterval = Seconds(m_gttTtl.GetSeconds() * 0.5);
+    }
+
+    // ActiveRouteTimeout = 2 * GttTtl (routes outlive GTT entries)
+    m_activeRouteTimeout = Seconds(m_gttTtl.GetSeconds() * 2.0);
+
+    // MyRouteTimeout depends on ActiveRouteTimeout
+    m_myRouteTimeout = Time(2 * std::max(m_pathDiscoveryTime, m_activeRouteTimeout));
+
+    // Propagate to sub-components so invalidated-route lifetime and
+    // neighbor purge interval stay in sync with the current TTL.
+    m_routingTable.SetBadLinkLifetime(m_activeRouteTimeout);
+    m_nb.SetPurgeDelay(m_activeRouteTimeout);
 }
 
 void

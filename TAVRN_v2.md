@@ -1,4 +1,4 @@
-# TAVRN v2.1: Topology Aware Vicinity-Reactive Network
+# TAVRN v2.2: Topology Aware Vicinity-Reactive Network
 
 ## Overview
 
@@ -318,6 +318,41 @@ NodeTraversalTime   = 40ms
 RreqRetries         = 2
 AllowedHelloLoss    = 2
 ```
+
+### Adaptive GTT TTL (Optional)
+
+When enabled via `EnableAdaptiveGttTtl = true`, the GTT TTL becomes dynamic rather than static. This mode is designed for Layer 2 environments that cannot report link failures in a timely manner (e.g., no MAC-layer TX failure callbacks). When L2 provides reliable failure reporting, the static TTL (default) is preferred for its lower overhead.
+
+**Tier 1 — Global TTL:**
+
+The global GTT TTL starts at `GttTtlMin` (default 60s) and grows toward `GttTtlMax` (default 300s) via exponential moving average (EMA) each maintenance cycle, provided the neighbor count has not changed:
+
+```
+TTL_new = alpha * TTL_old + (1 - alpha) * TTL_max
+```
+
+On direct neighbor gain or loss (detected by comparing neighbor count between maintenance ticks), the global TTL resets to `GttTtlMin` for fast re-convergence.
+
+All derived timers scale dynamically: `HelloInterval = 0.5 * TTL`, `ActiveRouteTimeout = 2 * TTL`.
+
+**Tier 2 — Per-Node TTL:**
+
+Each GTT entry has an optional per-node TTL override. When a remote TC-UPDATE NODE_JOIN is received (new or resurrected node), the per-node TTL for that entry snaps to `GttTtlMin` for fast tracking of the new node. Per-node TTLs grow toward the current global TTL via the same EMA each maintenance tick, and are always clamped to be <= the global TTL.
+
+**Adaptive TTL parameters:**
+
+| Parameter | Attribute | Default | Description |
+|-----------|-----------|---------|-------------|
+| Enable | `EnableAdaptiveGttTtl` | `false` | Whether adaptive TTL is active |
+| TTL floor | `GttTtlMin` | 60s | Fast-mode TTL during bootstrap/churn |
+| TTL ceiling | `GttTtlMax` | 300s | Steady-state TTL ceiling |
+| EMA alpha | `GttAlpha` | 0.7 | Smoothing factor (higher = slower growth) |
+
+**When to use adaptive TTL:**
+
+- L2 has no MAC TX failure callback (no `NotifyTxError` equivalent)
+- Network experiences frequent topology changes without L2 notification
+- Faster GTT convergence after topology changes is worth the overhead increase (~15% more control traffic)
 
 ### Configuration Profiles
 

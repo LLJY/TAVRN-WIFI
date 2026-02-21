@@ -96,6 +96,15 @@ class Neighbors
     }
 
     /**
+     * Update the purge timer delay (e.g., when adaptive GTT TTL changes ActiveRouteTimeout).
+     * @param delay the new purge timer delay
+     */
+    void SetPurgeDelay(Time delay)
+    {
+        m_ntimer.SetDelay(delay);
+    }
+
+    /**
      * Add ARP cache to be used to allow layer 2 notifications processing
      * @param a pointer to the ARP cache to add
      */

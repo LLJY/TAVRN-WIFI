@@ -48,6 +48,19 @@ struct GttEntry
     bool departed;         ///< True if the node has been confirmed departed after hard expiry + no response
 
     /**
+     * @brief Per-node effective TTL duration (Tier 2 of adaptive TTL).
+     *
+     * Each entry tracks its own TTL independently. On remote topology disruption
+     * (TC-UPDATE NODE_LEAVE for a non-neighbor), this snaps to TTL_min for
+     * surgical fast-checking of just that node without affecting the global TTL.
+     * Grows back toward the current global TTL via EMA after re-stabilization.
+     * Always <= the current global TTL (ceiling).
+     *
+     * A value of Time(0) means "use the table's default TTL" (backward compat).
+     */
+    Time perNodeTtl;
+
+    /**
      * @brief Default constructor — creates an empty/invalid entry.
      */
     GttEntry()
@@ -57,7 +70,8 @@ struct GttEntry
           softExpiry(Time(0)),
           seqNo(0),
           hopCount(0),
-          departed(false)
+          departed(false),
+          perNodeTtl(Time(0))
     {
     }
 
@@ -78,7 +92,8 @@ struct GttEntry
           softExpiry(soft),
           seqNo(seq),
           hopCount(hops),
-          departed(false)
+          departed(false),
+          perNodeTtl(Time(0))
     {
     }
 };
@@ -243,13 +258,51 @@ class GlobalTopologyTable
      * @brief Refresh an entry, resetting its TTL to full duration.
      *
      * Called when a freshness response or direct evidence is received.
-     * Resets ttlExpiry = Now() + defaultTtl, softExpiry = Now() + (defaultTtl * threshold),
-     * updates lastSeen = Now(), and updates the sequence number.
+     * Uses the entry's perNodeTtl if set (> 0), otherwise uses the table's
+     * defaultTtl. Resets ttlExpiry and softExpiry accordingly.
+     * Updates lastSeen = Now() and the sequence number.
      *
      * @param addr  IPv4 address of the node to refresh
      * @param seqNo Updated sequence number
      */
     void RefreshEntry(Ipv4Address addr, uint32_t seqNo);
+
+    /**
+     * @brief Set the per-node TTL override for a specific entry (Tier 2 adaptive TTL).
+     *
+     * When set to a value > 0, this entry uses perNodeTtl instead of the table's
+     * defaultTtl for its next refresh cycle. The per-node TTL is always clamped
+     * to be <= the table's current defaultTtl.
+     *
+     * Also immediately recalculates this entry's softExpiry and ttlExpiry based
+     * on the new perNodeTtl, using lastSeen as the reference time.
+     *
+     * @param addr       IPv4 address of the node
+     * @param perNodeTtl Per-node TTL duration; Time(0) reverts to table default
+     */
+    void SetPerNodeTtl(Ipv4Address addr, Time perNodeTtl);
+
+    /**
+     * @brief Grow a per-node TTL toward the table's current defaultTtl via EMA.
+     *
+     * perNodeTtl_new = alpha * perNodeTtl_old + (1 - alpha) * defaultTtl
+     * If the result is within 5% of defaultTtl, snaps to Time(0) (use default).
+     *
+     * @param addr  IPv4 address of the node
+     * @param alpha EMA smoothing factor in (0, 1). Higher = slower growth.
+     */
+    void GrowPerNodeTtl(Ipv4Address addr, double alpha);
+
+    /**
+     * @brief Clamp all per-node TTLs to be <= the given ceiling.
+     *
+     * Called when the global TTL resets to TTL_min. Any entry with a
+     * perNodeTtl > ceiling gets its perNodeTtl set to ceiling and its
+     * expiry times recalculated.
+     *
+     * @param ceiling Maximum allowed per-node TTL
+     */
+    void ClampAllPerNodeTtls(Time ceiling);
 
     /**
      * @brief Mark a node as departed.

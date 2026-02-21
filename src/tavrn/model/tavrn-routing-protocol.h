@@ -320,12 +320,47 @@ class RoutingProtocol : public Ipv4RoutingProtocol
     ///@{
 
     /**
-     * @brief GTT entry default time-to-live.
+     * @brief GTT entry time-to-live (current effective value).
      *
-     * Determines how long a GTT entry remains valid before hard expiry.
-     * Tunable: 30s (near-OLSR) to 300s (near-AODV).  Default: 120s.
+     * With adaptive TTL enabled, this is the Tier 1 "global TTL" that starts
+     * at m_gttTtlMin and grows toward m_gttTtlMax via EMA as the network
+     * proves stable.  Resets to m_gttTtlMin on neighbor gain/loss.
+     *
+     * With adaptive TTL disabled (default), this is the static GTT TTL.
+     * Tunable: 30s (near-OLSR) to 300s (near-AODV).  Default: 300s.
      */
     Time m_gttTtl;
+
+    // ---- Adaptive GTT TTL (Tier 1: Global + Tier 2: Per-Node) ----
+
+    /**
+     * @brief Whether adaptive GTT TTL is enabled (default: false).
+     * When true, m_gttTtl starts at m_gttTtlMin and grows toward m_gttTtlMax.
+     */
+    bool m_enableAdaptiveGttTtl;
+
+    /**
+     * @brief Minimum GTT TTL (fast mode during bootstrap/churn).
+     * Also the reset value when neighbor topology changes. Default: 60s.
+     */
+    Time m_gttTtlMin;
+
+    /**
+     * @brief Maximum GTT TTL (steady-state ceiling). Default: 300s.
+     */
+    Time m_gttTtlMax;
+
+    /**
+     * @brief EMA smoothing factor for GTT TTL growth.
+     * Higher = slower growth toward m_gttTtlMax. Default: 0.7.
+     */
+    double m_gttAlpha;
+
+    /**
+     * @brief Snapshot of neighbor count at the start of each GTT maintenance cycle.
+     * Used to detect neighbor gain/loss between cycles.
+     */
+    uint32_t m_lastNeighborCount;
 
     /**
      * @brief Fraction of GTT-TTL at which soft expiry triggers a freshness request.
@@ -339,16 +374,16 @@ class RoutingProtocol : public Ipv4RoutingProtocol
     /**
      * @brief Whether periodic HELLO messages are enabled.
      *
-     * When disabled (default), HELLOs are only sent during bootstrap.
-     * When enabled, periodic HELLOs provide faster failure detection at the
-     * cost of increased control overhead.
+     * When disabled, HELLOs are only sent during bootstrap.
+     * When enabled (default), periodic HELLOs provide faster failure detection
+     * at the cost of increased control overhead.
      */
     bool m_enablePeriodicHello;
 
     /**
      * @brief Interval between periodic HELLO broadcasts.
      *
-     * Only used when m_enablePeriodicHello is true.  Default: 10s.
+     * Only used when m_enablePeriodicHello is true.  Default: 150s (0.5 * GttTtl).
      */
     Time m_helloInterval;
 
@@ -1042,9 +1077,27 @@ class RoutingProtocol : public Ipv4RoutingProtocol
     /**
      * @brief Handle GTT maintenance timer expiration.
      *
-     * Calls CheckGttExpiry() and reschedules the timer.
+     * Calls CheckGttExpiry(), performs adaptive TTL growth (Tier 1),
+     * grows per-node TTLs toward global (Tier 2), and reschedules.
      */
     void GttMaintenanceTimerExpire();
+
+    /**
+     * @brief Reset global GTT TTL to m_gttTtlMin and clamp all per-node TTLs.
+     *
+     * Called when a direct neighbor is gained or lost, indicating structural
+     * topology change. Updates all derived timers (HelloInterval,
+     * ActiveRouteTimeout) and recalculates maintenance interval.
+     */
+    void ResetGlobalGttTtl();
+
+    /**
+     * @brief Recalculate derived timers from the current m_gttTtl.
+     *
+     * Updates: HelloInterval = 0.5 * m_gttTtl, ActiveRouteTimeout = 2 * m_gttTtl.
+     * Also syncs the GTT's default TTL.
+     */
+    void RecalcDerivedTimers();
 
     /**
      * @brief Reset RREQ count and reschedule the rate-limit timer (1 second interval).
