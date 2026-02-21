@@ -4,9 +4,9 @@
 # Runs 12 scenarios x N protocols x nRuns seeds, all in parallel (throttled).
 #
 # Usage:
-#   bash scratch/run-all-scenarios.sh [nRuns] [simTime] [maxJobs] [--baseline=FILE]
+#   bash scratch/run-all-scenarios.sh [nRuns] [simTime] [maxJobs] [--baseline=FILE] [--timeout=SECS]
 #
-# Defaults: nRuns=5, simTime=600, maxJobs=24
+# Defaults: nRuns=5, simTime=600, maxJobs=24, timeout=3600 (1hr)
 # Output:   results/tavrn-sweep-<timestamp>.csv
 #           results/tavrn-sweep-<timestamp>.txt
 #
@@ -24,12 +24,14 @@ NRUNS=5
 SIMTIME=600
 MAX_JOBS=24
 BASELINE=""
+JOB_TIMEOUT=3600  # Per-job wall-clock timeout in seconds (default: 1 hour)
 
 # Parse all arguments: positional (nRuns simTime maxJobs) and --baseline=FILE
 POS_ARGS=()
 for arg in "$@"; do
   case "$arg" in
     --baseline=*) BASELINE="${arg#--baseline=}" ;;
+    --timeout=*) JOB_TIMEOUT="${arg#--timeout=}" ;;
     *) POS_ARGS+=("$arg") ;;
   esac
 done
@@ -102,7 +104,7 @@ echo "║  ${TOTAL_JOBS} sim jobs (${TOTAL_SCENARIOS} scenarios × ${#PROTOCOLS[
 if [[ -n "$BASELINE" ]]; then
 echo "║  Baseline: $(basename "$BASELINE")                          ║"
 fi
-echo "║  simTime=${SIMTIME}s  maxParallel=${MAX_JOBS}                               ║"
+echo "║  simTime=${SIMTIME}s  maxParallel=${MAX_JOBS}  timeout=${JOB_TIMEOUT}s            ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo ""
 
@@ -141,13 +143,26 @@ for SCENARIO_DEF in "${SCENARIOS[@]}"; do
     echo "  [${JOB_NUM}/${TOTAL_JOBS}] START ${LABEL} / ${PROTO}"
 
     # Launch job — releases token when done
+    # Uses timeout to kill jobs that exceed JOB_TIMEOUT (e.g. AODV RREQ storms)
     (
-      if OUTPUT=$(./ns3 run "tavrn-comparison --protocol=${PROTO} ${ARGS} --simTime=${SIMTIME} --nRuns=${NRUNS}" 2>"$LOGFILE"); then
+      if OUTPUT=$(timeout --signal=KILL "${JOB_TIMEOUT}" ./ns3 run "tavrn-comparison --protocol=${PROTO} ${ARGS} --simTime=${SIMTIME} --nRuns=${NRUNS}" 2>"$LOGFILE"); then
         DATA_LINE=$(echo "$OUTPUT" | tail -1)
         echo "${LABEL},${DATA_LINE}" > "$OUTFILE"
         echo "  [DONE] ${LABEL} / ${PROTO}"
       else
-        echo "  [FAIL] ${LABEL} / ${PROTO} (see ${LOGFILE})"
+        EXIT_CODE=$?
+        if [[ $EXIT_CODE -eq 137 ]]; then
+          # Killed by timeout — generate DNF row
+          # Extract scenario params from ARGS for the CSV row
+          SCEN=$(echo "${ARGS}" | grep -oP '(?<=--scenario=)\S+' || echo "unknown")
+          NNODES=$(echo "${ARGS}" | grep -oP '(?<=--nNodes=)\S+' || echo "0")
+          NFLOWS=$(echo "${ARGS}" | grep -oP '(?<=--nFlows=)\S+' || echo "0")
+          # DNF row: -1 for all metrics (easily filterable)
+          echo "${LABEL},${PROTO},${SCEN},${NNODES},${NFLOWS},${SIMTIME},${NRUNS},-1,0,-1,0,-1,0,-1,0,-1,0,-1,0,-1,0,-1,0,-1,0,-1,0,-1,0" > "$OUTFILE"
+          echo "  [DNF]  ${LABEL} / ${PROTO} (killed after ${JOB_TIMEOUT}s — likely packet storm)"
+        else
+          echo "  [FAIL] ${LABEL} / ${PROTO} (exit ${EXIT_CODE}, see ${LOGFILE})"
+        fi
       fi
       echo "x" >&3  # release token
     ) &
@@ -197,6 +212,12 @@ for SCENARIO_DEF in "${SCENARIOS[@]}"; do
       COMPLETED=$((COMPLETED + 1))
     else
       echo "WARNING: missing result for ${LABEL}/${PROTO}"
+      # Generate a missing row so the CSV is always complete
+      SCEN_ARGS="${SCENARIO_DEF#*|}"
+      M_SCEN=$(echo "${SCEN_ARGS}" | grep -oP '(?<=--scenario=)\S+' || echo "unknown")
+      M_NNODES=$(echo "${SCEN_ARGS}" | grep -oP '(?<=--nNodes=)\S+' || echo "0")
+      M_NFLOWS=$(echo "${SCEN_ARGS}" | grep -oP '(?<=--nFlows=)\S+' || echo "0")
+      echo "${LABEL},${PROTO},${M_SCEN},${M_NNODES},${M_NFLOWS},${SIMTIME},${NRUNS},-1,0,-1,0,-1,0,-1,0,-1,0,-1,0,-1,0,-1,0,-1,0,-1,0,-1,0" >> "$CSV_FILE"
       FAILED=$((FAILED + 1))
     fi
   done
@@ -290,7 +311,17 @@ for scenario in scenarios:
                 line += f"  {'N/A':>16}"
                 continue
 
-            if metric_name == "TX+RX(J)":
+            # Check if this is a DNF row (all metrics are -1)
+            is_dnf = False
+            try:
+                if float(r.get("pdr_mean", 0)) == -1:
+                    is_dnf = True
+            except (ValueError, TypeError):
+                pass
+
+            if is_dnf:
+                cell = "DNF"
+            elif metric_name == "TX+RX(J)":
                 try:
                     tx = float(r.get("txEnergy_mean", 0))
                     rx = float(r.get("rxEnergy_mean", 0))
@@ -320,6 +351,13 @@ for scenario in scenarios:
         add(line)
     add("")
 
+# Count DNF rows
+dnf_count = sum(1 for r in rows if float(r.get("pdr_mean", 0)) == -1)
+if dnf_count > 0:
+    add(f"NOTE: {dnf_count} job(s) marked DNF (exceeded wall-clock timeout)")
+    add("  DNF jobs are excluded from wins calculation.")
+    add("")
+
 add("=" * 100)
 add("WINS SUMMARY (best value per scenario)")
 add("=" * 100)
@@ -340,6 +378,12 @@ for scenario in scenarios:
             r = lookup.get((scenario, p))
             if not r:
                 continue
+            # Skip DNF rows from wins calculation
+            try:
+                if float(r.get("pdr_mean", 0)) == -1:
+                    continue
+            except (ValueError, TypeError):
+                pass
             try:
                 if mname == "TX+RX Energy":
                     val = float(r.get("txEnergy_mean", 0)) + float(r.get("rxEnergy_mean", 0))

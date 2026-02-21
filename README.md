@@ -84,11 +84,13 @@ routeDiscovery_mean, routeDiscovery_ci95
 ### Full Sweep (17 Scenarios x 4 Protocols)
 
 ```bash
-bash scratch/run-all-scenarios.sh [nRuns] [simTime] [maxJobs]
-# Defaults: nRuns=5, simTime=600, maxJobs=24
+bash scratch/run-all-scenarios.sh [nRuns] [simTime] [maxJobs] [--timeout=SECS]
+# Defaults: nRuns=5, simTime=600, maxJobs=24, timeout=3600
 ```
 
 This runs 68 simulation jobs in parallel (throttled to `maxJobs`). Output goes to `results/tavrn-sweep-<timestamp>.csv`.
+
+Jobs exceeding the per-job timeout (default: 1 hour) are killed and marked **DNF** in the CSV (`-1` for all metrics). This is expected for protocols that generate pathological traffic on large topologies (e.g., AODV RREQ flooding on 49-50 node networks).
 
 **Resource requirements**: Large AODV scenarios (49-50 nodes) can use 4-5 GB RAM each. On a 32 GB machine, limit `maxJobs` to 6-8. A full sweep takes 1-4 hours depending on hardware.
 
