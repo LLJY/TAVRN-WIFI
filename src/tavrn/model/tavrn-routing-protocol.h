@@ -526,6 +526,10 @@ class RoutingProtocol : public Ipv4RoutingProtocol
     // --- Tracked pending SYNC_OFFER EventIds for broadcast dampening ---
     /// Maps mentee address to the scheduled SendSyncOffer EventId (cancellable by overheard offers).
     std::map<Ipv4Address, EventId> m_pendingSyncOfferEvents;
+
+    // --- Pending RREP-ACK events for unidirectional link detection ---
+    /// Maps neighbor address to the scheduled AckTimerExpire EventId (cancelled on RREP-ACK receipt).
+    std::map<Ipv4Address, EventId> m_pendingAckEvents;
     /// Cancel a pending SYNC_OFFER for a mentee (called when we overhear another offer).
     void CancelPendingSyncOffer(Ipv4Address mentee);
     ///@}

@@ -450,6 +450,12 @@ RoutingProtocol::DoDispose()
         Simulator::Cancel(pair.second);
     }
     m_pendingSyncOfferEvents.clear();
+    // Cancel pending RREP-ACK events
+    for (auto& pair : m_pendingAckEvents)
+    {
+        Simulator::Cancel(pair.second);
+    }
+    m_pendingAckEvents.clear();
 
     m_ipv4 = nullptr;
     for (auto iter = m_socketAddresses.begin(); iter != m_socketAddresses.end(); ++iter)
@@ -2092,15 +2098,24 @@ RoutingProtocol::SendReplyByIntermediateNode(RoutingTableEntry& toDst,
                            /*origin=*/toOrigin.GetDestination(),
                            /*lifetime=*/toDst.GetLifeTime());
 
-    // If neighbor, may be unidirectional — request ACK
+    // If destination is a direct neighbor, the link back toward origin may be
+    // unidirectional. Request RREP-ACK to verify (matches AODV RFC 3561 §6.8).
     if (toDst.GetHop() == 1)
     {
         rrepHeader.SetAckRequired(true);
-        RoutingTableEntry toNextHop;
-        m_routingTable.LookupRoute(toOrigin.GetNextHop(), toNextHop);
-        toNextHop.m_ackTimer.SetFunction(&RoutingProtocol::AckTimerExpire, this);
-        toNextHop.m_ackTimer.SetArguments(toNextHop.GetDestination(), m_blackListTimeout);
-        toNextHop.m_ackTimer.SetDelay(m_nextHopWait);
+        Ipv4Address nextHopAddr = toOrigin.GetNextHop();
+        // Cancel any existing pending ACK timer for this neighbor
+        auto it = m_pendingAckEvents.find(nextHopAddr);
+        if (it != m_pendingAckEvents.end())
+        {
+            Simulator::Cancel(it->second);
+        }
+        EventId ackEvent = Simulator::Schedule(m_nextHopWait,
+                                               &RoutingProtocol::AckTimerExpire,
+                                               this,
+                                               nextHopAddr,
+                                               m_blackListTimeout);
+        m_pendingAckEvents[nextHopAddr] = ackEvent;
     }
     toDst.InsertPrecursor(toOrigin.GetNextHop());
     toOrigin.InsertPrecursor(toDst.GetNextHop());
@@ -3547,7 +3562,9 @@ void
 RoutingProtocol::AckTimerExpire(Ipv4Address neighbor, Time blacklistTimeout)
 {
     NS_LOG_FUNCTION(this);
+    NS_LOG_DEBUG("RREP-ACK timeout for " << neighbor << " — blacklisting as unidirectional");
     m_routingTable.MarkLinkAsUnidirectional(neighbor, blacklistTimeout);
+    m_pendingAckEvents.erase(neighbor);
 }
 
 void
@@ -3651,6 +3668,7 @@ RoutingProtocol::UpdateRouteToNeighbor(Ipv4Address sender, Ipv4Address receiver)
             (toNeighbor.GetOutputDevice() == dev))
         {
             toNeighbor.SetLifeTime(std::max(m_activeRouteTimeout, toNeighbor.GetLifeTime()));
+            m_routingTable.Update(toNeighbor);
         }
         else
         {
@@ -4037,12 +4055,25 @@ void
 RoutingProtocol::RecvReplyAck(Ipv4Address neighbor)
 {
     NS_LOG_FUNCTION(this);
-    RoutingTableEntry rt;
-    if (m_routingTable.LookupRoute(neighbor, rt))
+    // Cancel the pending blacklist timer — link confirmed bidirectional
+    auto it = m_pendingAckEvents.find(neighbor);
+    if (it != m_pendingAckEvents.end())
     {
-        rt.m_ackTimer.Cancel();
-        rt.SetFlag(VALID);
-        m_routingTable.Update(rt);
+        Simulator::Cancel(it->second);
+        m_pendingAckEvents.erase(it);
+        NS_LOG_DEBUG("RREP-ACK received from " << neighbor << " — link confirmed symmetric");
+
+        // Clear any existing blacklist state and mark route valid
+        RoutingTableEntry rt;
+        if (m_routingTable.LookupRoute(neighbor, rt))
+        {
+            if (rt.IsUnidirectional())
+            {
+                rt.SetUnidirectional(false);
+            }
+            rt.SetFlag(VALID);
+            m_routingTable.Update(rt);
+        }
     }
 }
 

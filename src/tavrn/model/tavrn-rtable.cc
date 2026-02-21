@@ -369,6 +369,14 @@ RoutingTable::Purge()
     }
     for (auto i = m_ipv4AddressEntry.begin(); i != m_ipv4AddressEntry.end();)
     {
+        // Clear expired blacklist entries (timeout stored as absolute time)
+        if (i->second.IsUnidirectional() &&
+            i->second.GetBlacklistTimeout() < Simulator::Now())
+        {
+            NS_LOG_LOGIC("Blacklist expired for " << i->first);
+            i->second.SetUnidirectional(false);
+        }
+
         if (i->second.GetLifeTime().IsStrictlyNegative())
         {
             if (i->second.GetFlag() == INVALID)
@@ -442,9 +450,11 @@ RoutingTable::MarkLinkAsUnidirectional(Ipv4Address neighbor, Time blacklistTimeo
         return false;
     }
     i->second.SetUnidirectional(true);
-    i->second.SetBlacklistTimeout(blacklistTimeout);
+    // Store absolute expiry time, not duration
+    i->second.SetBlacklistTimeout(Simulator::Now() + blacklistTimeout);
     i->second.SetRreqCnt(0);
-    NS_LOG_LOGIC("Set link to " << neighbor << " to unidirectional");
+    NS_LOG_LOGIC("Set link to " << neighbor << " to unidirectional until "
+                 << (Simulator::Now() + blacklistTimeout).As(Time::S));
     return true;
 }
 
