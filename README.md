@@ -152,4 +152,4 @@ Across 17 scenarios comparing TAVRN, AODV, OLSR, and DSDV:
 
 ## License
 
-MIT
+GPL-2.0 — see [LICENSE](LICENSE). This matches ns-3's license.
