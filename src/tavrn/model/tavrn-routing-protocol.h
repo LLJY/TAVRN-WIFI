@@ -320,47 +320,52 @@ class RoutingProtocol : public Ipv4RoutingProtocol
     ///@{
 
     /**
-     * @brief GTT entry time-to-live (current effective value).
+     * @brief GTT entry time-to-live (static).
      *
-     * With adaptive TTL enabled, this is the Tier 1 "global TTL" that starts
-     * at m_gttTtlMin and grows toward m_gttTtlMax via EMA as the network
-     * proves stable.  Resets to m_gttTtlMin on neighbor gain/loss.
-     *
-     * With adaptive TTL disabled (default), this is the static GTT TTL.
+     * Controls how long GTT entries persist. HELLO interval is managed
+     * independently by EMA-based adaptive logic (not derived from this).
      * Tunable: 30s (near-OLSR) to 300s (near-AODV).  Default: 300s.
      */
     Time m_gttTtl;
 
-    // ---- Adaptive GTT TTL (Tier 1: Global + Tier 2: Per-Node) ----
+    // ---- Adaptive HELLO interval (EMA-based) ----
 
     /**
-     * @brief Whether adaptive GTT TTL is enabled (default: false).
-     * When true, m_gttTtl starts at m_gttTtlMin and grows toward m_gttTtlMax.
+     * @brief Minimum (fast) HELLO interval during bootstrap/churn. Default: 24s.
+     * HELLO interval resets here on neighbor topology change.
      */
-    bool m_enableAdaptiveGttTtl;
+    Time m_helloIntervalMin;
 
     /**
-     * @brief Minimum GTT TTL (fast mode during bootstrap/churn).
-     * Also the reset value when neighbor topology changes. Default: 60s.
+     * @brief Maximum (steady-state) HELLO interval. Default: 120s.
+     * HELLO interval grows toward this via EMA when topology is stable.
      */
-    Time m_gttTtlMin;
+    Time m_helloIntervalMax;
 
     /**
-     * @brief Maximum GTT TTL (steady-state ceiling). Default: 300s.
+     * @brief EMA smoothing factor for HELLO interval growth.
+     * Higher = slower growth toward m_helloIntervalMax. Default: 0.8.
      */
-    Time m_gttTtlMax;
-
-    /**
-     * @brief EMA smoothing factor for GTT TTL growth.
-     * Higher = slower growth toward m_gttTtlMax. Default: 0.7.
-     */
-    double m_gttAlpha;
+    double m_helloAlpha;
 
     /**
      * @brief Snapshot of neighbor count at the start of each GTT maintenance cycle.
-     * Used to detect neighbor gain/loss between cycles.
+     * Used to detect neighbor gain/loss between cycles, which resets
+     * the HELLO interval back to m_helloIntervalMin.
      */
     uint32_t m_lastNeighborCount;
+
+    /**
+     * @brief Liveness timeout floor — prevents false departures on HELLO reset.
+     *
+     * When HELLO interval shrinks (e.g., 120s → 24s on neighbor change),
+     * the liveness threshold (3×interval) would also shrink, potentially
+     * marking healthy neighbors as departed. This floor preserves the
+     * previous threshold until it naturally decays.
+     * Recalculated as max(3 × m_helloInterval, m_livenessFloor) and
+     * decayed each maintenance cycle.
+     */
+    Time m_livenessFloor;
 
     /**
      * @brief Fraction of GTT-TTL at which soft expiry triggers a freshness request.
@@ -381,9 +386,11 @@ class RoutingProtocol : public Ipv4RoutingProtocol
     bool m_enablePeriodicHello;
 
     /**
-     * @brief Interval between periodic HELLO broadcasts.
+     * @brief Current interval between periodic HELLO broadcasts.
      *
-     * Only used when m_enablePeriodicHello is true.  Default: 150s (0.5 * GttTtl).
+     * Managed by EMA-based adaptive logic: starts at m_helloIntervalMin (24s),
+     * grows toward m_helloIntervalMax (120s) when stable, resets to min on
+     * neighbor count change. Only active when m_enablePeriodicHello is true.
      */
     Time m_helloInterval;
 
@@ -511,12 +518,18 @@ class RoutingProtocol : public Ipv4RoutingProtocol
     void SyncPullTimeoutExpire();
 
     // --- Per-entry verification tracking for hard expiry ---
-    /// Tracks verification state for hard-expired GTT entries.
+    /// Multi-stage verification state for hard-expired GTT entries.
+    ///
+    /// Stage 0: Unicast HELLO via valid route (cheapest — route lives 1.2× GttTtl).
+    /// Stage 1: RREQ with Smart TTL → ERS escalation (delegates retries to RREQ mechanism).
+    /// Give up: Mark departed, broadcast TC-UPDATE(LEAVE).
     struct VerificationInfo
     {
-        Time firstVerifyTime;  ///< When first verification E_RREQ was sent
+        Time firstVerifyTime;  ///< When first verification was initiated
         Time lastProbeTime;    ///< When last verification probe was actually sent
         uint32_t retryCount;   ///< Number of verification probes actually sent
+        uint8_t stage;         ///< 0=unicast via route, 1=RREQ (Smart TTL → ERS)
+        bool ersCapped;        ///< True when GTT refreshed during ERS — cap expansion
     };
     /// Map of node addresses to their verification state.
     std::map<Ipv4Address, VerificationInfo> m_verificationState;
@@ -1037,13 +1050,28 @@ class RoutingProtocol : public Ipv4RoutingProtocol
     void SendFreshnessResponse(Ipv4Address requester, Ipv4Address subject);
 
     /**
+     * @brief Send a unicast verification HELLO to a hard-expired node via valid route.
+     *
+     * Uses the still-valid route (ActiveRouteTimeout = 1.2 × GttTtl > GttTtl)
+     * to send a targeted freshness request.  The target (or any intermediate
+     * node with fresh data) responds via SendFreshnessResponse, confirming
+     * liveness.  Much cheaper than RREQ: O(path_length) vs O(network_size).
+     *
+     * @param target the IP address of the hard-expired node to verify
+     * @return true if the verification was sent, false if no valid route exists
+     */
+    bool SendVerificationUnicast(Ipv4Address target);
+
+    /**
      * @brief Periodic GTT maintenance: check for soft and hard expiry.
      *
      * Iterates the GTT and:
      *  - For soft-expired entries: marks them for piggybacked freshness requests
-     *  - For hard-expired entries: sends targeted E_RREQ to verify existence
-     *  - For entries expired beyond 2x TTL with no response: marks departed,
-     *    broadcasts TC-UPDATE(LEAVE)
+     *  - For hard-expired entries with no demand: expires silently
+     *  - For hard-expired entries with demand: multi-stage verification:
+     *      Stage 0: Unicast HELLO via valid route (1.2× GttTtl > GttTtl)
+     *      Stage 1: RREQ with Smart TTL → ERS (delegates to RREQ mechanism)
+     *      Give up: marks departed, broadcasts TC-UPDATE(LEAVE)
      *  - Calls GlobalTopologyTable::Purge() to clean up old departed entries
      */
     void CheckGttExpiry();
@@ -1077,25 +1105,28 @@ class RoutingProtocol : public Ipv4RoutingProtocol
     /**
      * @brief Handle GTT maintenance timer expiration.
      *
-     * Calls CheckGttExpiry(), performs adaptive TTL growth (Tier 1),
-     * grows per-node TTLs toward global (Tier 2), and reschedules.
+     * Refreshes self entry, detects neighbor count changes (resets HELLO
+     * interval to min on change), runs CheckGttExpiry(), performs neighbor
+     * liveness checks, and reschedules.
      */
     void GttMaintenanceTimerExpire();
 
     /**
-     * @brief Reset global GTT TTL to m_gttTtlMin and clamp all per-node TTLs.
+     * @brief Check 1-hop neighbor liveness based on HELLO absence.
      *
-     * Called when a direct neighbor is gained or lost, indicating structural
-     * topology change. Updates all derived timers (HelloInterval,
-     * ActiveRouteTimeout) and recalculates maintenance interval.
+     * For each neighbor, if we haven't heard from them in
+     * 3 × m_helloInterval, mark departed and send TC-UPDATE(LEAVE).
+     * This gives fast failure detection for silent departures that
+     * MAC-layer error callbacks miss (no active traffic to the dead node).
      */
-    void ResetGlobalGttTtl();
+    void CheckNeighborLiveness();
 
     /**
      * @brief Recalculate derived timers from the current m_gttTtl.
      *
-     * Updates: HelloInterval = 0.5 * m_gttTtl, ActiveRouteTimeout = 2 * m_gttTtl.
+     * Updates: ActiveRouteTimeout = 1.2 * m_gttTtl.
      * Also syncs the GTT's default TTL.
+     * Note: HELLO interval is managed independently by EMA-based adaptive logic.
      */
     void RecalcDerivedTimers();
 

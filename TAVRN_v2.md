@@ -66,13 +66,151 @@ These are **scoping constraints**, not weaknesses. A protocol optimized for all 
 
 ---
 
+## Addressing: Entropy-Based Suffix Compression (ESC)
+
+TAVRN compresses L3 addresses on the wire using **Entropy-Based Suffix Compression (ESC)**, inspired by IPHC (RFC 6282) but adapted for TAVRN's unique architecture. ESC is PHY-agnostic: it works identically over IPv4, IPv6, and 802.15.4 without protocol changes.
+
+### Motivation
+
+Constrained mesh protocols universally compress addresses on the wire:
+
+| Protocol | Wire Address | Size | Context Source |
+|----------|-------------|------|----------------|
+| 6LoWPAN (RFC 6282) | IPHC-compressed IPv6 | 0/16/64-bit | Shared context table (management out of scope) |
+| 802.15.4 / Zigbee | PAN-local short address | 16-bit | Coordinator assigns during join |
+| Thread | RLOC16 (Router ID + Child ID) | 16-bit | Leader assigns Router ID |
+| Bluetooth Mesh | Unicast address | 16-bit | Provisioner assigns during provisioning |
+| Z-Wave | Node ID | 8-bit | Controller assigns during inclusion |
+| **TAVRN** | **Entropy-compressed suffix** | **1/2/8/16 B** | **GTT (already exists)** |
+
+Every protocol above requires an external mechanism to establish shared addressing context: a PAN coordinator, a leader, a provisioner, or an unspecified "context management" layer. **TAVRN already has this mechanism** -- the GTT. Every node maintains a synchronized topology view through mentorship and piggybacking. ESC leverages the GTT as the shared context table, requiring zero additional infrastructure.
+
+### Core Concept: Entropy from GTT
+
+**Entropy** is the minimum number of trailing address bytes required to uniquely identify every node in the GTT.
+
+Given a set of L3 addresses `{a1, a2, ..., aN}` in a node's GTT, the entropy `k` is:
+
+```
+k = min { j in [1, addrLen] : suffix(ai, j) != suffix(ak, j) for all i != k }
+```
+
+Where `suffix(addr, j)` returns the last `j` bytes of the address.
+
+**Examples**:
+- `/24` subnet (10.1.1.0/24): all addresses differ in the last byte. `k = 1`.
+- `/16` multi-subnet (10.1.1.5, 10.1.2.5): last byte collides. `k = 2`.
+- IPv6 with shared prefix: `k` depends on the interface ID diversity.
+
+The entropy computation is **deterministic**: given the same GTT contents, every node computes the same `k`. Since TAVRN's mentorship and piggybacking mechanisms converge the GTT across all nodes, entropy agreement follows naturally from GTT convergence.
+
+### Address Mode (AM) Field
+
+Inspired by IPHC's SAM/DAM encoding, each address field in a TAVRN header carries a **2-bit Address Mode (AM)** that tells the receiver how many bytes follow:
+
+```
+AM  Inline Bytes  Usage
+--  ------------  -----
+11  1 byte         Suffix-1: covers /24 networks, most IoT deployments
+10  2 bytes        Suffix-2: covers /16 networks, multi-subnet meshes
+01  8 bytes        Suffix-8: IPv6 interface ID (prefix elided)
+00  16 bytes       Full address: IPv6 (128-bit) or IPv4 (4 bytes, zero-padded)
+```
+
+The AM bits are packed into existing flag/control bytes in each header (see Message Types). For headers with two address fields (e.g., E_RREQ: origin + destination), both AM values are packed into a single byte alongside other flags.
+
+**Key difference from IPHC**: RFC 6282 states *"How the information is maintained in that shared context is out of scope."* In TAVRN, the context source is explicitly defined: it is the GTT, synchronized via mentorship (SYNC_OFFER/SYNC_PULL/SYNC_DATA) and maintained via piggybacking.
+
+### Sender Behavior
+
+1. **Compute entropy** `k` from own GTT: find the minimum suffix bytes for all known addresses to be unique.
+2. **Select AM** for each address field based on `k`:
+   - `k = 1` -> `AM = 11` (1 byte)
+   - `k = 2` -> `AM = 10` (2 bytes)
+   - `k <= 8` -> `AM = 01` (8 bytes)
+   - Otherwise -> `AM = 00` (full address)
+3. **Exception**: if the address is **not in the sender's GTT** (unknown node, e.g., RREQ for a node discovered via application hint), use `AM = 00` (full address). You cannot suffix-compress what you have not verified as unique.
+
+### Receiver Behavior
+
+1. **Read AM bits** from the header, read the corresponding number of inline bytes.
+2. **Look up the suffix** in the local GTT:
+   - **Unique match**: resolved. Proceed normally.
+   - **No match**: unknown node. Send E_RERR (standard "destination unreachable" behavior).
+   - **Multiple matches (ambiguous)**: the sender's entropy is stale. See Collision Handling below.
+
+### Collision Handling
+
+A suffix collision occurs when a receiver's GTT contains multiple nodes whose addresses share the same trailing `k` bytes. This can only happen when the sender's GTT is missing a node that the receiver knows about (i.e., the sender's entropy is stale).
+
+**Detection**: receiver decodes a suffix and finds >1 GTT match.
+
+**Response**: E_RERR with the **Ambiguity flag (A=1)** set (see E_RERR flags). The RERR carries the conflicting full addresses as topology metadata via normal piggybacking.
+
+**Recovery**: the sender receives the RERR, updates its GTT with the new topology information (piggybacked metadata), recomputes entropy (which increases), and retries the route discovery with a higher AM.
+
+```
+Example collision flow:
+
+Network: 10.1.1.0/24 + 10.1.2.0/24 (two subnets)
+Node B (stale GTT, k=1) -> E_RREQ [dest=0x05, AM=11]
+Node A (full GTT, k=2)  -> suffix 0x05 matches 10.1.1.5 AND 10.1.2.5
+Node A -> E_RERR [A=1, topology metadata includes both full addresses]
+Node B -> updates GTT, k bumps to 2
+Node B -> E_RREQ [dest=0x0105, AM=10] -> resolves unambiguously
+```
+
+This mirrors 6LoWPAN's fallback to full EUI-64 addresses on conflict, but TAVRN detects and resolves collisions automatically through existing error recovery mechanisms rather than requiring coordinator intervention.
+
+### Entropy Lifecycle
+
+- **Initialization**: `k` starts at 1 (minimum) when the GTT is first populated via mentorship.
+- **Increase**: immediate when a new node joins whose address collides at the current suffix length. The GTT update (via TC_UPDATE or mentorship) triggers recomputation.
+- **Decrease**: uses a **sticky high-water mark with slow decay**. Once `k` increases, it remains at the higher value for `10 * GTT_TTL` before decaying. This prevents oscillation when nodes join/leave rapidly. The rationale: increasing entropy is cheap (just send more bytes), but decreasing it risks ambiguity if the GTT hasn't fully converged after a departure.
+- **Reset**: on full node restart, `k` recomputes from the fresh GTT received during mentorship.
+
+### Bootstrap Addressing
+
+During bootstrap, a new node has no GTT and cannot compute entropy:
+
+- **HELLO**: always uses `AM = 00` (full L3 address). The new node announces itself with its complete address so existing nodes can add it to their GTTs.
+- **SYNC_OFFER**: mentor uses `AM = 00` for the mentee's address (the mentee may not know the network's entropy yet).
+- **SYNC_DATA**: always uses `AM = 00` (full L3 addresses) for all GTT entries. SYNC_DATA builds the mentee's GTT from scratch; the mentee needs full addresses to populate its context table.
+- **Post-mentorship**: once the mentee has a populated GTT, it computes `k` and switches to suffix compression for all subsequent messages.
+
+### Wire Format Impact
+
+| Field | Uncompressed (IPv4) | ESC (k=1) | ESC (k=2) |
+|-------|---------------------|-----------|-----------|
+| Node address | 4 bytes | 1 byte | 2 bytes |
+| Sequence number | 4 bytes | 2 bytes | 2 bytes |
+| Request ID | 4 bytes | 2 bytes | 2 bytes |
+| Lifetime | 4 bytes | 2 bytes (non-linear) | 2 bytes (non-linear) |
+| TTL (metadata) | 2 bytes | 4-bit bucket | 4-bit bucket |
+| Timestamp | 4 bytes | 2 bytes | 2 bytes |
+
+Address compression is the primary saving. Other field compressions (sequence numbers, lifetimes, TTL buckets) are applied uniformly regardless of entropy level.
+
+### ns-3 Simulation Mapping
+
+In the ns-3 simulation environment (WiFi + IPv4 on a 10.1.1.0/24 subnet):
+- Entropy is always `k = 1` (last octet uniquely identifies each node)
+- All address fields use `AM = 11` (1-byte suffix)
+- `suffix = ipv4_addr.Get() & 0xFF` (last octet)
+- `full_addr = network_prefix | suffix` (reverse mapping)
+- The network prefix is set once during `RoutingProtocol::Start()`
+
+This is not a simplification -- it is the correct ESC behavior for a /24 network. A multi-subnet ns-3 scenario would naturally produce `k = 2` with zero code changes.
+
+---
+
 ## Architecture
 
 ```
 +-----------------------------------------------------------+
 |  Application / Service Discovery (Matter, CoAP, etc.)     |
 +-----------------------------------------------------------+
-|  TAVRN v2.1                                               |
+|  TAVRN v2.2                                               |
 |  +- GTT (Global Topology Table) - who exists              |
 |  |    +- Local knowledge, opportunistically refreshed     |
 |  +- Routing (AODV-based) - how to reach                   |
@@ -120,25 +258,66 @@ TAVRN mechanisms mirror how humans and social animals maintain relationships:
 
 ## Message Types
 
-| Message | Type ID | Category | Purpose |
-|---------|---------|----------|---------|
-| E_RREQ | 1 | Routing + Topology | Route request with piggybacked topology metadata (23B, AODV wire-compatible) |
-| E_RREP | 2 | Routing + Topology | Route reply with piggybacked topology metadata (19B, AODV wire-compatible) |
-| E_RERR | 3 | Routing + Topology | Route error with piggybacked topology metadata |
-| HELLO | 4 | Topology | Node join announcement (9B: 4B addr + 4B seqNo + 1B flags); optionally periodic |
-| SYNC_OFFER | 5 | Topology | Mentor offers topology sync to new node (12B: 4B mentor + 4B gttSize + 4B mentee); **broadcast** for dampening |
-| SYNC_PULL | 6 | Topology | Mentee requests topology page from mentor (8B: 4B index + 4B count) |
-| SYNC_DATA | 7 | Topology | Mentor sends topology page (9B header + N * 15B per entry) |
-| TC-UPDATE | 8 | Topology | Broadcast on node join/leave events (17B: 8B UUID + 4B subject + 1B event + 4B timestamp) |
-| E_RREP_ACK | 9 | Routing | RREP acknowledgment for unidirectional link detection (1B reserved, mirrors AODV) |
+All headers use ESC (Entropy-Based Suffix Compression) for address fields on the wire. Each address field is preceded by a 2-bit AM (Address Mode) packed into the header's flags byte. Sequence numbers are 16-bit. See "Addressing: Entropy-Based Suffix Compression (ESC)" for details.
+
+Wire sizes below are shown for `k=1` (1-byte suffixes, typical /24 IoT network). Sizes scale with entropy: at `k=2`, each address field adds 1 byte.
+
+| Message | Type ID | Category | Wire Size (k=1) | Purpose |
+|---------|---------|----------|------------------|---------|
+| E_RREQ | 1 | Routing + Topology | **10B** | Route request: `[1B flags+AM][1B hop][2B reqId][kB dst][2B dstSeq][kB origin][2B originSeq]` |
+| E_RREP | 2 | Routing + Topology | **8B** | Route reply: `[1B flags+AM][1B hop][kB dst][2B dstSeq][kB origin][2B lifetime]` |
+| E_RERR | 3 | Routing + Topology | **1 + 3N** | Route error: `[1B flags+A+count][N * (kB dst + 2B seqNo)]`. **A flag**: address ambiguity (see ESC Collision Handling) |
+| HELLO | 4 | Topology | **4B** | Node announcement: `[kB node][2B seqNo][1B flags]` (bootstrap: AM=00, full address) |
+| SYNC_OFFER | 5 | Topology | **3B** | Mentor offers sync: `[kB mentor][1B gttSize][kB mentee]` |
+| SYNC_PULL | 6 | Topology | **2B** | Request page: `[1B index][1B count]` |
+| SYNC_DATA | 7 | Topology | **3 + 7N** | Topology page: `[1B start][1B total][1B count][N * (L3B fullAddr + 2B lastSeen + 1B ttlBucket + 2B seqNo + 1B hop)]`. Always AM=00 (full addresses) |
+| TC-UPDATE | 8 | Topology | **7B** | Join/leave: `[kB origin][2B seqNo][kB subject][1B event][2B timestamp]` |
+| E_RREP_ACK | 9 | Routing | **1B** | RREP acknowledgment (1B reserved, mirrors AODV) |
+
+### E_RERR Flags Byte
+
+```
+ 0   1   2   3   4   5   6   7
++---+---+---+---+---+---+---+---+
+| N |  AM_d | A |   destCount   |
++---+---+---+---+---+---+---+---+
+
+N (1 bit):    No-delete flag (standard AODV behavior)
+AM_d (2 bits): Address Mode for destination entries
+A (1 bit):    Ambiguity flag -- set when RERR is caused by suffix collision
+              (receiver detected multiple GTT matches for a compressed address).
+              Signals sender to increase entropy and retry.
+destCount (4 bits): Number of unreachable destinations (0-15)
+```
+
+### Size Comparison with AODV (IPv4)
+
+| Packet | AODV (IPv4) | TAVRN (k=1) | TAVRN (k=2) | Ratio (k=1) |
+|--------|-------------|-------------|-------------|-------------|
+| RREQ bare | 24B | 10B | 12B | 0.42x |
+| RREP | 20B | 8B | 10B | 0.40x |
+| RERR (1 dest) | 12B | 4B | 5B | 0.33x |
+| RREQ + 4 metadata | n/a | 19B | 23B | 0.79x vs AODV RREQ |
+
+TAVRN's E_RREQ with full topology piggybacking (4 entries) at k=1 is **5 bytes smaller** than a bare AODV RREQ. At k=2, it is still 1 byte smaller.
 
 ### Topology Metadata Extension
 
 Piggybacked on E_RREQ, E_RREP, and E_RERR messages. Also piggybacked on data packets when conditional piggybacking is active.
 
-Wire format: `[1B count][N * (4B addr + 2B ttl + 1B flags)]` = 1 + 7N bytes.
+Wire format: `[1B count+AM][N * (kB suffix + 1B packed{4-bit TTL bucket | 4-bit flags})]` = **1 + (k+1)N bytes**.
 
-Flags: bit 0 = `freshness_request` (soft-expiry query).
+The AM for metadata entries is shared (all entries in one extension use the same AM, packed into the count byte).
+
+TTL bucket encoding: `bucket = min(15, ttl_seconds / 20)`, decode: `ttl = bucket * 20`. Max encodable: 300s.
+
+Flags (lower 4 bits): bit 0 = `freshness_request` (soft-expiry query).
+
+### Lifetime Encoding (E_RREP)
+
+Route lifetimes are encoded in 2 bytes using non-linear encoding:
+- Values 0--16383ms: stored directly (bit 15 = 0)
+- Values > 16383ms: bit 15 = 1, bits 0-14 = ms / 100 (max ~3276.7s)
 
 ---
 
@@ -199,7 +378,7 @@ A -> N:  SYNC_DATA (nodes 15-29)
 ...repeat until complete...
 ```
 
-Each SYNC_DATA entry is 15 bytes: 4B addr + 4B lastSeen + 2B ttl + 4B seqNo + 1B hopCount. The mentee hop count is set to mentor's hopCount + 1.
+Each SYNC_DATA entry is 7 bytes at k=1: kB suffix + 2B lastSeen + 1B ttlBucket + 2B seqNo + 1B hopCount. SYNC_DATA always uses AM=00 (full L3 addresses) to build the mentee's GTT from scratch; at AM=00 with IPv4, each entry is 10 bytes (4B addr + 2B + 1B + 2B + 1B). The mentee hop count is set to mentor's hopCount + 1.
 
 **Mentor Death Recovery:**
 - Each SYNC_PULL starts a timeout timer (2x net traversal time)
@@ -319,40 +498,46 @@ RreqRetries         = 2
 AllowedHelloLoss    = 2
 ```
 
-### Adaptive GTT TTL (Optional)
+### Adaptive HELLO Interval (EMA-based)
 
-When enabled via `EnableAdaptiveGttTtl = true`, the GTT TTL becomes dynamic rather than static. This mode is designed for Layer 2 environments that cannot report link failures in a timely manner (e.g., no MAC-layer TX failure callbacks). When L2 provides reliable failure reporting, the static TTL (default) is preferred for its lower overhead.
+The HELLO interval is decoupled from GttTtl and managed independently via exponential moving average (EMA). This provides fast convergence during bootstrap and topology changes while minimizing overhead in steady state.
 
-**Tier 1 — Global TTL:**
+**Mechanism:**
 
-The global GTT TTL starts at `GttTtlMin` (default 60s) and grows toward `GttTtlMax` (default 300s) via exponential moving average (EMA) each maintenance cycle, provided the neighbor count has not changed:
+The HELLO interval starts at `HelloIntervalMin` (default 24s) and grows toward `HelloIntervalMax` (default 120s) via EMA each time a HELLO fires:
 
 ```
-TTL_new = alpha * TTL_old + (1 - alpha) * TTL_max
+Interval_new = alpha * Interval_old + (1 - alpha) * Interval_max
 ```
 
-On direct neighbor gain or loss (detected by comparing neighbor count between maintenance ticks), the global TTL resets to `GttTtlMin` for fast re-convergence.
+When the interval reaches 95% of max, it snaps to the ceiling. On direct neighbor gain or loss (detected by comparing neighbor count between GTT maintenance ticks), the interval resets to `HelloIntervalMin` and the HELLO timer is immediately rescheduled for fast re-convergence.
 
-All derived timers scale dynamically: `HelloInterval = 0.5 * TTL`, `ActiveRouteTimeout = 2 * TTL`.
+GttTtl remains static (default 300s). ActiveRouteTimeout = 1.2 * GttTtl.
 
-**Tier 2 — Per-Node TTL:**
+**Neighbor liveness detection:**
 
-Each GTT entry has an optional per-node TTL override. When a remote TC-UPDATE NODE_JOIN is received (new or resurrected node), the per-node TTL for that entry snaps to `GttTtlMin` for fast tracking of the new node. Per-node TTLs grow toward the current global TTL via the same EMA each maintenance tick, and are always clamped to be <= the global TTL.
+During each GTT maintenance cycle, `CheckNeighborLiveness` iterates all 1-hop neighbors and checks each neighbor's GTT `lastSeen` timestamp. If `now - lastSeen > livenessTimeout`, the neighbor is marked departed and a TC-UPDATE(NODE_LEAVE) is broadcast.
 
-**Adaptive TTL parameters:**
+The liveness timeout uses a hysteresis floor to prevent false departures when the HELLO interval resets from a long cadence to a short one:
+
+```
+livenessTimeout = max(3 * currentHelloInterval, livenessFloor)
+```
+
+The floor is set to the previous `3 * interval` when a reset occurs and decays by half each maintenance cycle until it reaches the current threshold.
+
+**Adaptive HELLO parameters:**
 
 | Parameter | Attribute | Default | Description |
 |-----------|-----------|---------|-------------|
-| Enable | `EnableAdaptiveGttTtl` | `false` | Whether adaptive TTL is active |
-| TTL floor | `GttTtlMin` | 60s | Fast-mode TTL during bootstrap/churn |
-| TTL ceiling | `GttTtlMax` | 300s | Steady-state TTL ceiling |
-| EMA alpha | `GttAlpha` | 0.7 | Smoothing factor (higher = slower growth) |
+| Min interval | `HelloIntervalMin` | 24s | Fast-mode HELLO during bootstrap/churn |
+| Max interval | `HelloIntervalMax` | 120s | Steady-state HELLO ceiling |
+| EMA alpha | `HelloAlpha` | 0.8 | Smoothing factor (higher = slower growth) |
+| Enable | `EnablePeriodicHello` | `true` | Whether periodic HELLOs are active |
 
-**When to use adaptive TTL:**
+**Design rationale (replaces Adaptive GTT TTL):**
 
-- L2 has no MAC TX failure callback (no `NotifyTxError` equivalent)
-- Network experiences frequent topology changes without L2 notification
-- Faster GTT convergence after topology changes is worth the overhead increase (~15% more control traffic)
+The previous adaptive GTT TTL mechanism caused a self-sabotaging feedback loop: neighbor count changes reset the GTT TTL from steady-state to minimum, which shortened all derived timers (HELLO, ActiveRouteTimeout), causing more frequent expiry, more verification, more churn, and more resets. The TTL never reached steady state. Decoupling HELLO from GttTtl eliminates this loop while preserving fast failure detection.
 
 ### Configuration Profiles
 

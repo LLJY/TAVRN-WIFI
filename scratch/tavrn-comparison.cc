@@ -28,8 +28,10 @@
 #include "ns3/energy-module.h"
 #include "ns3/flow-monitor-module.h"
 #include "ns3/internet-module.h"
+#include "ns3/ipv4-l3-protocol.h"
 #include "ns3/mobility-module.h"
 #include "ns3/network-module.h"
+#include "ns3/udp-header.h"
 #include "ns3/wifi-module.h"
 #include "ns3/wifi-co-trace-helper.h"
 #include "ns3/wifi-radio-energy-model-helper.h"
@@ -77,8 +79,14 @@ static std::vector<double> g_routeDiscoveryTimesMs;
 /// Total bytes transmitted at PHY level across all nodes.
 static uint64_t g_totalPhyTxBytes = 0;
 
-/// Steady-state measurement: PHY bytes after bootstrap settles.
+/// Total bytes received at PHY level across all nodes.
+static uint64_t g_totalPhyRxBytes = 0;
+
+/// Steady-state PHY TX bytes (after bootstrap settles).
 static uint64_t g_steadyStatePhyTxBytes = 0;
+
+/// Steady-state PHY RX bytes (after bootstrap settles).
+static uint64_t g_steadyStatePhyRxBytes = 0;
 
 /// Time after which we consider the network "steady state" (set per run).
 static double g_steadyStateStartSec = 0.0;
@@ -86,6 +94,103 @@ static double g_steadyStateStartSec = 0.0;
 // =============================================================================
 // Trace sink callbacks
 // =============================================================================
+
+/// Port range for application flows — set per run for IP-level classification.
+static uint16_t g_appPortBase = 0;
+static uint32_t g_appFlowCount = 0;
+
+/// Per-hop IP-layer bytes: ALL packets and data-only packets.
+/// Both are measured at the same pipeline stage, so subtraction is valid.
+static uint64_t g_totalIpTxBytes = 0;
+static uint64_t g_totalIpDataBytes = 0;
+static uint64_t g_steadyStateIpTxBytes = 0;
+static uint64_t g_steadyStateIpDataBytes = 0;
+
+// =============================================================================
+// Temporal sampling state — periodic snapshots for time-series analysis
+// =============================================================================
+
+/// Sampling interval in seconds (0 = disabled). Set via --sampleInterval CLI.
+static double g_sampleInterval = 0.0;
+
+/// Runtime pointers for the sampling callback (set per run, cleared after).
+static NodeContainer* g_nodesPtr = nullptr;
+static Ptr<FlowMonitor> g_flowMonPtr = nullptr;
+static Ptr<Ipv4FlowClassifier> g_classifierPtr = nullptr;
+static std::string g_currentProtocol;
+static double g_simTime = 0.0;
+
+/// Previous-sample cumulative counters for delta computation.
+static uint64_t g_prevSampleIpTxBytes = 0;
+static uint64_t g_prevSampleIpDataBytes = 0;
+static uint32_t g_prevSampleFlowTx = 0;
+static uint32_t g_prevSampleFlowRx = 0;
+static double g_prevSampleDelaySum = 0.0;
+static uint32_t g_prevSampleDelayCount = 0;
+
+/// A single temporal sample capturing metrics at one point in time.
+struct TimeSample
+{
+    double timeSec;         ///< Simulation time of this sample
+    double overheadBps;     ///< Window overhead rate (bytes/s)
+    double pdr;             ///< Window PDR (-1 if no packets in window)
+    double latencyMs;       ///< Window average latency (-1 if no packets)
+    double precision;       ///< Topology precision: correct / known (-1 if N/A)
+    double recall;          ///< Topology recall: correct / (alive-1) (-1 if N/A)
+    double staleRatio;      ///< Stale entries / known entries (-1 if N/A)
+    uint32_t aliveNodes;    ///< Ground truth: nodes with interface up
+    uint32_t knownNodes;    ///< Protocol's view: nodes it thinks exist
+    uint32_t staleNodes;    ///< Known but actually dead/down
+};
+
+/// Collected samples for the current run.
+static std::vector<TimeSample> g_timeSamples;
+
+/**
+ * @brief IP-level TX trace — counts per-hop data bytes by port inspection.
+ *
+ * Connected to Ipv4L3Protocol::Tx on every node.  Fires for every IP
+ * packet transmitted, including forwarded packets at intermediate hops.
+ * We peek at the IP+UDP headers to classify packets by destination port.
+ *
+ * Data bytes counted here represent the true per-hop application load.
+ * overhead = PhyTxBytes - IpDataBytes  correctly excludes multi-hop
+ * data forwarding from the overhead metric.
+ */
+static void
+Ipv4TxTraceSink(Ptr<const Packet> packet, Ptr<Ipv4> ipv4, uint32_t iface)
+{
+    uint32_t sz = packet->GetSize();
+    bool isSteady = Simulator::Now().GetSeconds() >= g_steadyStateStartSec;
+
+    // Count ALL IP-level TX bytes
+    g_totalIpTxBytes += sz;
+    if (isSteady)
+    {
+        g_steadyStateIpTxBytes += sz;
+    }
+
+    // Classify: peek at IP header to check if it's UDP app data
+    Ipv4Header ipHeader;
+    Ptr<Packet> copy = packet->Copy();
+    copy->RemoveHeader(ipHeader);
+
+    if (ipHeader.GetProtocol() == 17) // UDP
+    {
+        UdpHeader udpHeader;
+        copy->PeekHeader(udpHeader);
+        uint16_t dstPort = udpHeader.GetDestinationPort();
+
+        if (dstPort >= g_appPortBase && dstPort < g_appPortBase + g_appFlowCount)
+        {
+            g_totalIpDataBytes += sz;
+            if (isSteady)
+            {
+                g_steadyStateIpDataBytes += sz;
+            }
+        }
+    }
+}
 
 /**
  * @brief Trace sink for TAVRN control overhead.
@@ -118,15 +223,8 @@ TavrnRouteDiscoverySink(Ipv4Address dst, Time latency)
  * @brief PHY-level TX sniffer — counts ALL transmitted bytes.
  *
  * Connected to MonitorSnifferTx on every node's WifiPhy.
- * This captures all frames including broadcast control traffic that
- * FlowMonitor misses, providing a symmetric overhead measurement
- * across all protocols.
- *
- * @param packet       the packet being transmitted (includes MAC header)
- * @param channelFreq  the channel frequency in MHz
- * @param txVector     TX parameters
- * @param aMpdu        A-MPDU info
- * @param staId        STA-ID
+ * For overhead computation, data bytes are tracked separately at the
+ * IP layer via Ipv4TxTraceSink (which correctly counts forwarded copies).
  */
 static void
 PhyTxSnifferSink(Ptr<const Packet> packet,
@@ -140,6 +238,28 @@ PhyTxSnifferSink(Ptr<const Packet> packet,
     if (Simulator::Now().GetSeconds() >= g_steadyStateStartSec)
     {
         g_steadyStatePhyTxBytes += sz;
+    }
+}
+
+/**
+ * @brief PHY-level RX sniffer — counts ALL received bytes.
+ *
+ * Connected to MonitorSnifferRx on every node's WifiPhy.
+ * Mirrors the TX sniffer for symmetric measurement.
+ */
+static void
+PhyRxSnifferSink(Ptr<const Packet> packet,
+                 uint16_t channelFreq,
+                 WifiTxVector txVector,
+                 MpduInfo aMpdu,
+                 SignalNoiseDbm signalNoise,
+                 uint16_t staId)
+{
+    uint32_t sz = packet->GetSize();
+    g_totalPhyRxBytes += sz;
+    if (Simulator::Now().GetSeconds() >= g_steadyStateStartSec)
+    {
+        g_steadyStatePhyRxBytes += sz;
     }
 }
 
@@ -198,17 +318,40 @@ ConnectTavrnTraces(NodeContainer& nodes)
 }
 
 // =============================================================================
-// Connect PHY-level TX sniffer on all nodes (protocol-agnostic)
+// Connect IP-level TX trace on all nodes for per-hop data classification
 // =============================================================================
 
 /**
- * @brief Connect MonitorSnifferTx on every node's WifiPhy.
+ * @brief Connect Ipv4L3Protocol::Tx on every node.
  *
- * This is the uniform overhead measurement method: counts ALL bytes
- * transmitted at the PHY level regardless of protocol.
+ * Fires for every IP packet transmitted (including forwarded).  The callback
+ * inspects UDP destination port to classify data vs control packets.
  */
 static void
-ConnectPhyTxTraces(NetDeviceContainer& wifiDevices)
+ConnectIpTxTraces(NodeContainer& nodes)
+{
+    for (uint32_t i = 0; i < nodes.GetN(); ++i)
+    {
+        Ptr<Ipv4L3Protocol> ipv4l3 =
+            nodes.Get(i)->GetObject<Ipv4L3Protocol>();
+        if (ipv4l3)
+        {
+            ipv4l3->TraceConnectWithoutContext("Tx",
+                                               MakeCallback(&Ipv4TxTraceSink));
+        }
+    }
+}
+
+// =============================================================================
+// Connect PHY-level TX/RX sniffers on all nodes (protocol-agnostic)
+// =============================================================================
+
+/**
+ * @brief Connect MonitorSnifferTx and MonitorSnifferRx on every node's
+ *        WifiPhy for symmetric TX/RX byte measurement.
+ */
+static void
+ConnectPhyTraces(NetDeviceContainer& wifiDevices)
 {
     for (uint32_t i = 0; i < wifiDevices.GetN(); ++i)
     {
@@ -222,6 +365,8 @@ ConnectPhyTxTraces(NetDeviceContainer& wifiDevices)
         {
             phy->TraceConnectWithoutContext("MonitorSnifferTx",
                                            MakeCallback(&PhyTxSnifferSink));
+            phy->TraceConnectWithoutContext("MonitorSnifferRx",
+                                           MakeCallback(&PhyRxSnifferSink));
         }
     }
 }
@@ -405,6 +550,307 @@ ComputeOlsrTopologyAccuracy(NodeContainer nodes)
 }
 
 // =============================================================================
+// Topology precision / recall / stale ratio — unified for TAVRN + OLSR
+// =============================================================================
+
+/// Result of a topology accuracy snapshot.
+struct TopologyMetrics
+{
+    double precision;    ///< correct / known (-1 if N/A)
+    double recall;       ///< correct / (alive-1) (-1 if N/A)
+    double staleRatio;   ///< stale / known (-1 if N/A)
+    uint32_t aliveCount;
+    uint32_t knownCount; ///< average across alive nodes
+    uint32_t staleCount; ///< average across alive nodes
+};
+
+/**
+ * @brief Helper to extract the specific routing protocol instance from a node.
+ *
+ * Handles the common case where Ipv4ListRouting wraps the actual protocol.
+ */
+template <typename T>
+static Ptr<T>
+GetRoutingProtocolFromNode(Ptr<Node> node)
+{
+    Ptr<Ipv4> ipv4 = node->GetObject<Ipv4>();
+    if (!ipv4)
+    {
+        return nullptr;
+    }
+    Ptr<Ipv4RoutingProtocol> proto = ipv4->GetRoutingProtocol();
+    if (!proto)
+    {
+        return nullptr;
+    }
+    Ptr<T> result = DynamicCast<T>(proto);
+    if (result)
+    {
+        return result;
+    }
+    Ptr<Ipv4ListRouting> listRouting = DynamicCast<Ipv4ListRouting>(proto);
+    if (listRouting)
+    {
+        for (uint32_t j = 0; j < listRouting->GetNRoutingProtocols(); ++j)
+        {
+            int16_t priority;
+            Ptr<Ipv4RoutingProtocol> rp = listRouting->GetRoutingProtocol(j, priority);
+            result = DynamicCast<T>(rp);
+            if (result)
+            {
+                return result;
+            }
+        }
+    }
+    return nullptr;
+}
+
+/**
+ * @brief Compute topology precision, recall, and stale ratio for any protocol.
+ *
+ * Precision = |known ∩ alive| / |known|     (how much of what we know is correct)
+ * Recall    = |known ∩ alive| / (|alive|-1)  (how many alive nodes we know about)
+ * StaleRatio = |known - alive| / |known|     (fraction of stale entries)
+ *
+ * For TAVRN: "known" = non-departed GTT entries.
+ * For OLSR/OLSR-Tuned: "known" = union of NeighborSet + TwoHopNeighborSet + TopologySet.
+ * For AODV/DSDV: returns -1 (no accessible topology table).
+ */
+static TopologyMetrics
+ComputeTopologyMetrics(NodeContainer& nodes, const std::string& protocol)
+{
+    TopologyMetrics result{-1.0, -1.0, -1.0, 0, 0, 0};
+
+    if (protocol != "TAVRN" && protocol != "OLSR" && protocol != "OLSR-Tuned")
+    {
+        return result; // No topology introspection for AODV/DSDV
+    }
+
+    // Step 1: Ground truth — alive nodes (interface up)
+    std::set<Ipv4Address> aliveAddrs;
+    for (uint32_t i = 0; i < nodes.GetN(); ++i)
+    {
+        Ptr<Ipv4> ipv4 = nodes.Get(i)->GetObject<Ipv4>();
+        if (ipv4 && ipv4->IsUp(1))
+        {
+            aliveAddrs.insert(ipv4->GetAddress(1, 0).GetLocal());
+        }
+    }
+
+    if (aliveAddrs.size() <= 1)
+    {
+        result.aliveCount = aliveAddrs.size();
+        result.precision = 1.0;
+        result.recall = 1.0;
+        result.staleRatio = 0.0;
+        return result;
+    }
+
+    result.aliveCount = aliveAddrs.size();
+
+    double sumPrecision = 0.0;
+    double sumRecall = 0.0;
+    double sumStale = 0.0;
+    uint32_t count = 0;
+    uint32_t totalKnown = 0;
+    uint32_t totalStale = 0;
+
+    for (uint32_t i = 0; i < nodes.GetN(); ++i)
+    {
+        Ptr<Ipv4> ipv4 = nodes.Get(i)->GetObject<Ipv4>();
+        if (!ipv4 || !ipv4->IsUp(1))
+        {
+            continue;
+        }
+        Ipv4Address myAddr = ipv4->GetAddress(1, 0).GetLocal();
+
+        // Collect this node's view of the topology
+        std::set<Ipv4Address> knownAddrs;
+
+        if (protocol == "TAVRN")
+        {
+            Ptr<tavrn::RoutingProtocol> tavrnProto =
+                GetRoutingProtocolFromNode<tavrn::RoutingProtocol>(nodes.Get(i));
+            if (tavrnProto)
+            {
+                for (const auto& addr : tavrnProto->GetGtt().EnumerateNodes())
+                {
+                    if (addr != myAddr)
+                    {
+                        knownAddrs.insert(addr);
+                    }
+                }
+            }
+        }
+        else // OLSR or OLSR-Tuned
+        {
+            Ptr<olsr::RoutingProtocol> olsrProto =
+                GetRoutingProtocolFromNode<olsr::RoutingProtocol>(nodes.Get(i));
+            if (olsrProto)
+            {
+                const olsr::OlsrState& state = olsrProto->GetOlsrState();
+                for (const auto& nb : state.GetNeighbors())
+                {
+                    knownAddrs.insert(nb.neighborMainAddr);
+                }
+                for (const auto& th : state.GetTwoHopNeighbors())
+                {
+                    knownAddrs.insert(th.neighborMainAddr);
+                    knownAddrs.insert(th.twoHopNeighborAddr);
+                }
+                for (const auto& tc : state.GetTopologySet())
+                {
+                    knownAddrs.insert(tc.destAddr);
+                    knownAddrs.insert(tc.lastAddr);
+                }
+                knownAddrs.erase(myAddr);
+            }
+        }
+
+        if (knownAddrs.empty())
+        {
+            continue;
+        }
+
+        uint32_t correct = 0;
+        uint32_t stale = 0;
+        for (const auto& addr : knownAddrs)
+        {
+            if (aliveAddrs.count(addr) > 0)
+            {
+                ++correct;
+            }
+            else
+            {
+                ++stale;
+            }
+        }
+
+        double nodePrecision =
+            static_cast<double>(correct) / static_cast<double>(knownAddrs.size());
+        double nodeRecall =
+            static_cast<double>(correct) / static_cast<double>(aliveAddrs.size() - 1);
+        double nodeStale =
+            static_cast<double>(stale) / static_cast<double>(knownAddrs.size());
+
+        sumPrecision += nodePrecision;
+        sumRecall += nodeRecall;
+        sumStale += nodeStale;
+        totalKnown += knownAddrs.size();
+        totalStale += stale;
+        ++count;
+    }
+
+    if (count > 0)
+    {
+        result.precision = sumPrecision / count;
+        result.recall = sumRecall / count;
+        result.staleRatio = sumStale / count;
+        result.knownCount = totalKnown / count;
+        result.staleCount = totalStale / count;
+    }
+
+    return result;
+}
+
+// =============================================================================
+// Periodic temporal sampling callback
+// =============================================================================
+
+/**
+ * @brief Scheduled callback that captures a snapshot of all metrics.
+ *
+ * Called every g_sampleInterval seconds during the simulation.
+ * Computes deltas from last sample for windowed metrics, and point-in-time
+ * topology accuracy metrics.
+ */
+static void
+DoTemporalSample()
+{
+    TimeSample s{};
+    s.timeSec = Simulator::Now().GetSeconds();
+
+    // --- Window overhead (IP-layer) ---
+    uint64_t curIpTx = g_totalIpTxBytes;
+    uint64_t curIpData = g_totalIpDataBytes;
+    uint64_t deltaIpTx = curIpTx - g_prevSampleIpTxBytes;
+    uint64_t deltaIpData = curIpData - g_prevSampleIpDataBytes;
+    s.overheadBps = (deltaIpTx > deltaIpData)
+                        ? static_cast<double>(deltaIpTx - deltaIpData) / g_sampleInterval
+                        : 0.0;
+    g_prevSampleIpTxBytes = curIpTx;
+    g_prevSampleIpDataBytes = curIpData;
+
+    // --- Window PDR and latency from FlowMonitor ---
+    s.pdr = -1.0;
+    s.latencyMs = -1.0;
+    if (g_flowMonPtr && g_classifierPtr)
+    {
+        uint32_t curFlowTx = 0;
+        uint32_t curFlowRx = 0;
+        double curDelaySum = 0.0;
+        uint32_t curDelayCount = 0;
+
+        const auto& stats = g_flowMonPtr->GetFlowStats();
+        for (const auto& [flowId, fs] : stats)
+        {
+            Ipv4FlowClassifier::FiveTuple tuple = g_classifierPtr->FindFlow(flowId);
+            bool isApp = (tuple.destinationPort >= g_appPortBase &&
+                          tuple.destinationPort < g_appPortBase + g_appFlowCount);
+            if (isApp)
+            {
+                curFlowTx += fs.txPackets;
+                curFlowRx += fs.rxPackets;
+                if (fs.rxPackets > 0)
+                {
+                    curDelaySum += fs.delaySum.GetMilliSeconds();
+                    curDelayCount += fs.rxPackets;
+                }
+            }
+        }
+
+        uint32_t deltaTx = curFlowTx - g_prevSampleFlowTx;
+        uint32_t deltaRx = curFlowRx - g_prevSampleFlowRx;
+        if (deltaTx > 0)
+        {
+            s.pdr = static_cast<double>(deltaRx) / static_cast<double>(deltaTx);
+        }
+
+        double deltaDelay = curDelaySum - g_prevSampleDelaySum;
+        uint32_t deltaDelayN = curDelayCount - g_prevSampleDelayCount;
+        if (deltaDelayN > 0)
+        {
+            s.latencyMs = deltaDelay / deltaDelayN;
+        }
+
+        g_prevSampleFlowTx = curFlowTx;
+        g_prevSampleFlowRx = curFlowRx;
+        g_prevSampleDelaySum = curDelaySum;
+        g_prevSampleDelayCount = curDelayCount;
+    }
+
+    // --- Topology precision / recall / stale ---
+    if (g_nodesPtr)
+    {
+        TopologyMetrics tm = ComputeTopologyMetrics(*g_nodesPtr, g_currentProtocol);
+        s.precision = tm.precision;
+        s.recall = tm.recall;
+        s.staleRatio = tm.staleRatio;
+        s.aliveNodes = tm.aliveCount;
+        s.knownNodes = tm.knownCount;
+        s.staleNodes = tm.staleCount;
+    }
+
+    g_timeSamples.push_back(s);
+
+    // Reschedule next sample (stop before sim end to avoid edge effects)
+    if (Simulator::Now().GetSeconds() + g_sampleInterval < g_simTime - 1.0)
+    {
+        Simulator::Schedule(Seconds(g_sampleInterval), &DoTemporalSample);
+    }
+}
+
+// =============================================================================
 // Per-run result structure
 // =============================================================================
 
@@ -412,15 +858,23 @@ struct RunResult
 {
     double pdr;
     double avgLatencyMs;
-    uint64_t totalOverheadBytes;       // Full simulation PHY overhead
+    uint64_t steadyTxBytes;            // Raw PHY TX bytes during steady state
+    uint64_t steadyRxBytes;            // Raw PHY RX bytes during steady state
+    uint64_t totalOverheadBytes;       // PhyTx - IpDataTx over full sim (true overhead)
     uint64_t bootstrapOverheadBytes;   // PHY bytes during bootstrap phase only
-    double steadyStateOverheadBps;     // Control overhead bytes/s during steady state
+    double steadyOverheadBps;          // (steadyPhyTx - steadyIpData) / duration
     double energyJ;                    // Total energy (incl. idle) — for convention
     double txEnergyJ;                  // TX-only energy (active radio cost)
     double rxEnergyJ;                  // RX-only energy (active radio cost)
     double gttAccuracy; // -1.0 for non-TAVRN
     double avgConvergenceMs;
     double avgRouteDiscoveryMs;
+
+    // Temporal metrics (from periodic sampling)
+    double twPrecision;       ///< Time-weighted avg topology precision (-1 if N/A)
+    double twRecall;          ///< Time-weighted avg topology recall (-1 if N/A)
+    double avgStaleRatio;     ///< Time-weighted avg stale route ratio (-1 if N/A)
+    double firstDeliveryMs;   ///< Time from first TX to first RX across all flows (-1 if none)
 };
 
 // =============================================================================
@@ -457,8 +911,30 @@ RunSingleSimulation(const std::string& protocol,
     g_convergenceTimesMs.clear();
     g_routeDiscoveryTimesMs.clear();
     g_totalPhyTxBytes = 0;
+    g_totalPhyRxBytes = 0;
     g_steadyStatePhyTxBytes = 0;
+    g_steadyStatePhyRxBytes = 0;
+    g_totalIpTxBytes = 0;
+    g_totalIpDataBytes = 0;
+    g_steadyStateIpTxBytes = 0;
+    g_steadyStateIpDataBytes = 0;
     g_steadyStateStartSec = 0.0; // Will be set below after appStartBase is defined
+    g_appPortBase = appPort;
+    g_appFlowCount = std::min(nFlows, nNodes / 2);
+
+    // Reset temporal sampling state
+    g_timeSamples.clear();
+    g_prevSampleIpTxBytes = 0;
+    g_prevSampleIpDataBytes = 0;
+    g_prevSampleFlowTx = 0;
+    g_prevSampleFlowRx = 0;
+    g_prevSampleDelaySum = 0.0;
+    g_prevSampleDelayCount = 0;
+    g_nodesPtr = nullptr;
+    g_flowMonPtr = nullptr;
+    g_classifierPtr = nullptr;
+    g_currentProtocol = protocol;
+    g_simTime = simTime;
 
     // Configure random seed for reproducibility
     SeedManager::SetSeed(seed);
@@ -697,11 +1173,11 @@ RunSingleSimulation(const std::string& protocol,
     {
         TavrnHelper tavrn;
         tavrn.Set("GttTtl", TimeValue(Seconds(300)));
-        tavrn.Set("ActiveRouteTimeout", TimeValue(Seconds(600)));
         tavrn.Set("SoftExpiryThreshold", DoubleValue(0.5));
         tavrn.Set("EnablePeriodicHello", BooleanValue(true));
-        tavrn.Set("HelloInterval", TimeValue(Seconds(150)));
         tavrn.Set("MaxMetadataEntries", UintegerValue(4));
+        // Adaptive HELLO: starts at 24s (fast bootstrap), grows via EMA to 120s.
+        // GttTtl stays static at 300s. Neighbor liveness checks detect silent failures.
         stack.SetRoutingHelper(tavrn);
     }
     else if (protocol == "AODV")
@@ -709,9 +1185,30 @@ RunSingleSimulation(const std::string& protocol,
         AodvHelper aodv;
         stack.SetRoutingHelper(aodv);
     }
+    else if (protocol == "AODV-Tuned")
+    {
+        // Control experiment: AODV with TAVRN-like high timer values.
+        // Proves that GTT enables high timers — without topology awareness,
+        // AODV cannot detect failures or maintain routes with such long intervals.
+        AodvHelper aodv;
+        aodv.Set("HelloInterval", TimeValue(Seconds(150)));
+        aodv.Set("ActiveRouteTimeout", TimeValue(Seconds(600)));
+        aodv.Set("AllowedHelloLoss", UintegerValue(2));
+        stack.SetRoutingHelper(aodv);
+    }
     else if (protocol == "OLSR")
     {
         OlsrHelper olsr;
+        stack.SetRoutingHelper(olsr);
+    }
+    else if (protocol == "OLSR-Tuned")
+    {
+        // Control experiment: OLSR with relaxed timer values to reduce overhead.
+        // Shows the tradeoff between overhead reduction and topology accuracy
+        // when a proactive protocol lengthens its broadcast intervals.
+        OlsrHelper olsr;
+        olsr.Set("HelloInterval", TimeValue(Seconds(30)));
+        olsr.Set("TcInterval", TimeValue(Seconds(60)));
         stack.SetRoutingHelper(olsr);
     }
     else if (protocol == "DSDV")
@@ -724,7 +1221,7 @@ RunSingleSimulation(const std::string& protocol,
     else
     {
         NS_FATAL_ERROR("Unknown protocol: " << protocol
-                                             << ". Use TAVRN, AODV, OLSR, or DSDV.");
+                                             << ". Use TAVRN, AODV, AODV-Tuned, OLSR, OLSR-Tuned, or DSDV.");
     }
 
     stack.Install(nodes);
@@ -869,7 +1366,7 @@ RunSingleSimulation(const std::string& protocol,
     // -------------------------------------------------------------------------
     // Connect PHY-level TX sniffer for ALL protocols
     // -------------------------------------------------------------------------
-    ConnectPhyTxTraces(wifiDevices);
+    ConnectPhyTraces(wifiDevices);
 
     // -------------------------------------------------------------------------
     // Connect TAVRN trace sources (must be done after stack installation)
@@ -878,6 +1375,11 @@ RunSingleSimulation(const std::string& protocol,
     {
         ConnectTavrnTraces(nodes);
     }
+
+    // -------------------------------------------------------------------------
+    // Connect IP-level TX trace for per-hop data byte classification
+    // -------------------------------------------------------------------------
+    ConnectIpTxTraces(nodes);
 
     // -------------------------------------------------------------------------
     // Applications: CBR UDP flows between deterministic pairs
@@ -981,6 +1483,22 @@ RunSingleSimulation(const std::string& protocol,
     FlowMonitorHelper flowMonHelper;
     Ptr<FlowMonitor> flowMon = flowMonHelper.InstallAll();
 
+    // Get classifier now (available immediately after InstallAll) for sampling
+    Ptr<Ipv4FlowClassifier> classifier =
+        DynamicCast<Ipv4FlowClassifier>(flowMonHelper.GetClassifier());
+
+    // -------------------------------------------------------------------------
+    // Schedule temporal sampling (if enabled)
+    // -------------------------------------------------------------------------
+    if (g_sampleInterval > 0.0)
+    {
+        g_nodesPtr = &nodes;
+        g_flowMonPtr = flowMon;
+        g_classifierPtr = classifier;
+        // Start sampling at the first sample interval (captures bootstrap phase too)
+        Simulator::Schedule(Seconds(g_sampleInterval), &DoTemporalSample);
+    }
+
     // -------------------------------------------------------------------------
     // Run simulation
     // -------------------------------------------------------------------------
@@ -994,8 +1512,7 @@ RunSingleSimulation(const std::string& protocol,
     // Collect results
     // -------------------------------------------------------------------------
     flowMon->CheckForLostPackets();
-    Ptr<Ipv4FlowClassifier> classifier =
-        DynamicCast<Ipv4FlowClassifier>(flowMonHelper.GetClassifier());
+    // classifier was already obtained before Simulator::Run()
 
     uint32_t totalTxPackets = 0;
     uint32_t totalRxPackets = 0;
@@ -1032,35 +1549,35 @@ RunSingleSimulation(const std::string& protocol,
         }
     }
 
-    // Control overhead = total PHY TX bytes - application data TX bytes.
-    // This is uniform across all protocols and captures broadcast control traffic
-    // that FlowMonitor misses for AODV/OLSR.
-    // Note: appDataTxBytes from FlowMonitor counts IP-level bytes (including headers),
-    // while g_totalPhyTxBytes counts MAC-level bytes. The difference captures:
+    // ---- Overhead computation (IP-layer, per-hop correct) ----
+    // Both total and data bytes are measured at the IP layer (Ipv4L3Protocol::Tx),
+    // so subtraction is valid — no pipeline timing mismatch between layers.
+    //
+    // overhead = IpTxBytes - IpDataBytes captures:
     //   - All routing control messages (RREQ, RREP, RERR, HELLO, TC, etc.)
-    //   - MAC-level retransmissions
-    //   - MAC/PHY overhead on data frames
-    // This is a standard approach in MANET protocol comparison papers.
+    //   - ARP requests/replies (go through IP)
+    // This does NOT include pure MAC-level overhead (beacons, ACKs, retries),
+    // which is symmetric across all protocols and irrelevant for comparison.
+
     // Total overhead (entire simulation)
     uint64_t totalOverheadBytes = 0;
-    if (g_totalPhyTxBytes > appDataTxBytes)
+    if (g_totalIpTxBytes > g_totalIpDataBytes)
     {
-        totalOverheadBytes = g_totalPhyTxBytes - appDataTxBytes;
+        totalOverheadBytes = g_totalIpTxBytes - g_totalIpDataBytes;
     }
 
-    // Bootstrap overhead = PHY bytes during [0, appStartBase) only
-    // bootstrapPhyBytes = totalPhyBytes - steadyStatePhyBytes
-    uint64_t bootstrapPhyBytes = g_totalPhyTxBytes - g_steadyStatePhyTxBytes;
-    uint64_t bootstrapOverheadBytes = bootstrapPhyBytes; // No app data during bootstrap
+    // Bootstrap overhead = IP bytes during [0, appStartBase) only
+    uint64_t bootstrapIpBytes = g_totalIpTxBytes - g_steadyStateIpTxBytes;
+    uint64_t bootstrapOverheadBytes = bootstrapIpBytes; // No app data during bootstrap
 
-    // Steady-state control overhead rate (bytes/s)
-    // = (steadyStatePhyTx - appDataTx) / steadyStateDuration
+    // Steady-state overhead rate (bytes/s)
     double steadyStateDuration = simTime - appStartBase;
-    double steadyStateOverheadBps = 0.0;
-    if (steadyStateDuration > 0.0 && g_steadyStatePhyTxBytes > appDataTxBytes)
+    double steadyOverheadBps = 0.0;
+    if (steadyStateDuration > 0.0 && g_steadyStateIpTxBytes > g_steadyStateIpDataBytes)
     {
-        steadyStateOverheadBps =
-            static_cast<double>(g_steadyStatePhyTxBytes - appDataTxBytes) / steadyStateDuration;
+        steadyOverheadBps =
+            static_cast<double>(g_steadyStateIpTxBytes - g_steadyStateIpDataBytes) /
+            steadyStateDuration;
     }
 
     // PDR
@@ -1072,9 +1589,11 @@ RunSingleSimulation(const std::string& protocol,
     result.avgLatencyMs = (delayCount > 0) ? (totalDelayMs / delayCount) : 0.0;
 
     // Overhead metrics
+    result.steadyTxBytes = g_steadyStatePhyTxBytes;
+    result.steadyRxBytes = g_steadyStatePhyRxBytes;
     result.totalOverheadBytes = totalOverheadBytes;
     result.bootstrapOverheadBytes = bootstrapOverheadBytes;
-    result.steadyStateOverheadBps = steadyStateOverheadBps;
+    result.steadyOverheadBps = steadyOverheadBps;
 
     // Total energy consumed (includes idle — reported for convention)
     result.energyJ = 0.0;
@@ -1118,7 +1637,7 @@ RunSingleSimulation(const std::string& protocol,
     {
         result.gttAccuracy = ComputeAverageGttAccuracy(nodes);
     }
-    else if (protocol == "OLSR")
+    else if (protocol == "OLSR" || protocol == "OLSR-Tuned")
     {
         result.gttAccuracy = ComputeOlsrTopologyAccuracy(nodes);
     }
@@ -1142,6 +1661,69 @@ RunSingleSimulation(const std::string& protocol,
                                      0.0);
         result.avgRouteDiscoveryMs = sum / g_routeDiscoveryTimesMs.size();
     }
+
+    // ---- First packet delivery time (convergence metric for ALL protocols) ----
+    result.firstDeliveryMs = -1.0;
+    {
+        Time earliest = Seconds(simTime);
+        Time earliestTx = Seconds(simTime);
+        bool found = false;
+        const auto& allStats = flowMon->GetFlowStats();
+        for (const auto& [flowId, fs] : allStats)
+        {
+            Ipv4FlowClassifier::FiveTuple tuple = classifier->FindFlow(flowId);
+            bool isApp = (tuple.destinationPort >= g_appPortBase &&
+                          tuple.destinationPort < g_appPortBase + g_appFlowCount);
+            if (isApp && fs.rxPackets > 0)
+            {
+                if (!found || fs.timeFirstRxPacket < earliest)
+                {
+                    earliest = fs.timeFirstRxPacket;
+                    earliestTx = fs.timeFirstTxPacket;
+                    found = true;
+                }
+            }
+        }
+        if (found)
+        {
+            result.firstDeliveryMs =
+                (earliest.GetSeconds() - earliestTx.GetSeconds()) * 1000.0;
+        }
+    }
+
+    // ---- Time-series summary metrics ----
+    result.twPrecision = -1.0;
+    result.twRecall = -1.0;
+    result.avgStaleRatio = -1.0;
+    if (!g_timeSamples.empty())
+    {
+        double sumPrec = 0.0;
+        double sumRec = 0.0;
+        double sumStale = 0.0;
+        uint32_t nPrec = 0;
+
+        for (const auto& s : g_timeSamples)
+        {
+            if (s.precision >= 0.0)
+            {
+                sumPrec += s.precision;
+                sumRec += s.recall;
+                sumStale += s.staleRatio;
+                ++nPrec;
+            }
+        }
+        if (nPrec > 0)
+        {
+            result.twPrecision = sumPrec / nPrec;
+            result.twRecall = sumRec / nPrec;
+            result.avgStaleRatio = sumStale / nPrec;
+        }
+    }
+
+    // Clear sampling global pointers before Destroy (avoid dangling)
+    g_nodesPtr = nullptr;
+    g_flowMonPtr = nullptr;
+    g_classifierPtr = nullptr;
 
     Simulator::Destroy();
     return result;
@@ -1221,9 +1803,10 @@ main(int argc, char* argv[])
     uint32_t churnNodes = 0;  // number of nodes in rolling churn pool
     double churnInterval = 60.0; // seconds between churn rotations
     bool hubTraffic = false;  // mixed hub traffic: half flows → node 0, half peer-to-peer
+    double sampleInterval = 0.0; // temporal sampling interval (s), 0 = disabled
 
     CommandLine cmd(__FILE__);
-    cmd.AddValue("protocol", "Routing protocol: TAVRN, AODV, OLSR, DSDV", protocol);
+    cmd.AddValue("protocol", "Routing protocol: TAVRN, AODV, AODV-Tuned, OLSR, OLSR-Tuned, DSDV", protocol);
     cmd.AddValue("nNodes", "Number of nodes", nNodes);
     cmd.AddValue("simTime", "Simulation time in seconds", simTime);
     cmd.AddValue("nFlows", "Number of CBR UDP flows", nFlows);
@@ -1245,7 +1828,11 @@ main(int argc, char* argv[])
     cmd.AddValue("churnNodes", "Rolling churn: nodes cycling offline per interval", churnNodes);
     cmd.AddValue("churnInterval", "Rolling churn: seconds between rotations", churnInterval);
     cmd.AddValue("hubTraffic", "Mixed hub traffic: half flows to node 0, half peer-to-peer", hubTraffic);
+    cmd.AddValue("sampleInterval", "Temporal sampling interval in seconds (0=disabled)", sampleInterval);
     cmd.Parse(argc, argv);
+
+    // Set global sampling interval
+    g_sampleInterval = sampleInterval;
 
     if (scenario != "grid" && scenario != "linear" && scenario != "mobile" &&
         scenario != "home")
@@ -1259,7 +1846,9 @@ main(int argc, char* argv[])
     // -------------------------------------------------------------------------
     std::vector<double> allPdr;
     std::vector<double> allLatency;
-    std::vector<double> allSteadyBps;
+    std::vector<double> allSteadyTx;
+    std::vector<double> allSteadyRx;
+    std::vector<double> allSteadyOverheadBps;
     std::vector<double> allBootstrapBytes;
     std::vector<double> allTotalOverhead;
     std::vector<double> allEnergy;
@@ -1268,15 +1857,21 @@ main(int argc, char* argv[])
     std::vector<double> allGttAccuracy;
     std::vector<double> allConvergence;
     std::vector<double> allRouteDiscovery;
+    std::vector<double> allTwPrecision;
+    std::vector<double> allTwRecall;
+    std::vector<double> allAvgStaleRatio;
+    std::vector<double> allFirstDelivery;
 
     // Print CSV header
     if (nRuns == 1)
     {
         std::cout << "protocol,scenario,nNodes,nFlows,simTime,seed,"
                   << "pdr,avgLatencyMs,"
-                  << "steadyStateOverheadBps,bootstrapOverheadBytes,totalOverheadBytes,"
+                  << "steadyTxBytes,steadyRxBytes,"
+                  << "steadyOverheadBps,bootstrapOverheadBytes,totalOverheadBytes,"
                   << "energyJ,txEnergyJ,rxEnergyJ,"
-                  << "gttAccuracy,avgConvergenceMs,avgRouteDiscoveryMs"
+                  << "gttAccuracy,avgConvergenceMs,avgRouteDiscoveryMs,"
+                  << "twPrecision,twRecall,avgStaleRatio,firstDeliveryMs"
                   << std::endl;
     }
     else
@@ -1284,7 +1879,9 @@ main(int argc, char* argv[])
         std::cout << "protocol,scenario,nNodes,nFlows,simTime,nRuns,"
                   << "pdr_mean,pdr_ci95,"
                   << "latency_mean,latency_ci95,"
-                  << "steadyBps_mean,steadyBps_ci95,"
+                  << "steadyTx_mean,steadyTx_ci95,"
+                  << "steadyRx_mean,steadyRx_ci95,"
+                  << "steadyOverheadBps_mean,steadyOverheadBps_ci95,"
                   << "bootstrapBytes_mean,bootstrapBytes_ci95,"
                   << "totalOverhead_mean,totalOverhead_ci95,"
                   << "energy_mean,energy_ci95,"
@@ -1292,7 +1889,11 @@ main(int argc, char* argv[])
                   << "rxEnergy_mean,rxEnergy_ci95,"
                   << "gttAccuracy_mean,gttAccuracy_ci95,"
                   << "convergence_mean,convergence_ci95,"
-                  << "routeDiscovery_mean,routeDiscovery_ci95"
+                  << "routeDiscovery_mean,routeDiscovery_ci95,"
+                  << "twPrecision_mean,twPrecision_ci95,"
+                  << "twRecall_mean,twRecall_ci95,"
+                  << "avgStaleRatio_mean,avgStaleRatio_ci95,"
+                  << "firstDelivery_mean,firstDelivery_ci95"
                   << std::endl;
     }
 
@@ -1324,7 +1925,9 @@ main(int argc, char* argv[])
 
         allPdr.push_back(r.pdr);
         allLatency.push_back(r.avgLatencyMs);
-        allSteadyBps.push_back(r.steadyStateOverheadBps);
+        allSteadyTx.push_back(static_cast<double>(r.steadyTxBytes));
+        allSteadyRx.push_back(static_cast<double>(r.steadyRxBytes));
+        allSteadyOverheadBps.push_back(r.steadyOverheadBps);
         allBootstrapBytes.push_back(static_cast<double>(r.bootstrapOverheadBytes));
         allTotalOverhead.push_back(static_cast<double>(r.totalOverheadBytes));
         allEnergy.push_back(r.energyJ);
@@ -1333,6 +1936,10 @@ main(int argc, char* argv[])
         allGttAccuracy.push_back(r.gttAccuracy);
         allConvergence.push_back(r.avgConvergenceMs);
         allRouteDiscovery.push_back(r.avgRouteDiscoveryMs);
+        allTwPrecision.push_back(r.twPrecision);
+        allTwRecall.push_back(r.twRecall);
+        allAvgStaleRatio.push_back(r.avgStaleRatio);
+        allFirstDelivery.push_back(r.firstDeliveryMs);
 
         // For single runs, output per-run CSV line
         if (nRuns == 1)
@@ -1346,7 +1953,9 @@ main(int argc, char* argv[])
                       << seed << ","
                       << r.pdr << ","
                       << r.avgLatencyMs << ","
-                      << r.steadyStateOverheadBps << ","
+                      << r.steadyTxBytes << ","
+                      << r.steadyRxBytes << ","
+                      << r.steadyOverheadBps << ","
                       << r.bootstrapOverheadBytes << ","
                       << r.totalOverheadBytes << ","
                       << r.energyJ << ","
@@ -1354,23 +1963,51 @@ main(int argc, char* argv[])
                       << r.rxEnergyJ << ","
                       << r.gttAccuracy << ","
                       << r.avgConvergenceMs << ","
-                      << r.avgRouteDiscoveryMs
+                      << r.avgRouteDiscoveryMs << ","
+                      << r.twPrecision << ","
+                      << r.twRecall << ","
+                      << r.avgStaleRatio << ","
+                      << r.firstDeliveryMs
                       << std::endl;
         }
 
-        // Output TAVRN-specific extended metrics to stderr for each run
-        if (protocol == "TAVRN")
+        // Output extended per-run metrics to stderr
+        std::cerr << "#RUN," << protocol << ","
+                  << seed << ","
+                  << "gtt_accuracy=" << r.gttAccuracy << ","
+                  << "convergence_ms=" << r.avgConvergenceMs << ","
+                  << "route_discovery_ms=" << r.avgRouteDiscoveryMs << ","
+                  << "steady_overhead_bps=" << r.steadyOverheadBps << ","
+                  << "steady_tx=" << r.steadyTxBytes << ","
+                  << "steady_rx=" << r.steadyRxBytes << ","
+                  << "bootstrap_bytes=" << r.bootstrapOverheadBytes << ","
+                  << "tx_energy_j=" << r.txEnergyJ << ","
+                  << "rx_energy_j=" << r.rxEnergyJ << ","
+                  << "tw_precision=" << r.twPrecision << ","
+                  << "tw_recall=" << r.twRecall << ","
+                  << "avg_stale_ratio=" << r.avgStaleRatio << ","
+                  << "first_delivery_ms=" << r.firstDeliveryMs
+                  << std::endl;
+
+        // Output time-series data to stderr (if sampling was enabled)
+        if (!g_timeSamples.empty())
         {
-            std::cerr << "#TAVRN_RUN,"
-                      << seed << ","
-                      << "gtt_accuracy=" << r.gttAccuracy << ","
-                      << "convergence_ms=" << r.avgConvergenceMs << ","
-                      << "route_discovery_ms=" << r.avgRouteDiscoveryMs << ","
-                      << "steady_bps=" << r.steadyStateOverheadBps << ","
-                      << "bootstrap_bytes=" << r.bootstrapOverheadBytes << ","
-                      << "tx_energy_j=" << r.txEnergyJ << ","
-                      << "rx_energy_j=" << r.rxEnergyJ
-                      << std::endl;
+            for (const auto& ts : g_timeSamples)
+            {
+                std::cerr << std::fixed << std::setprecision(4)
+                          << "#TS," << protocol << "," << seed << ","
+                          << ts.timeSec << ","
+                          << ts.overheadBps << ","
+                          << ts.pdr << ","
+                          << ts.latencyMs << ","
+                          << ts.precision << ","
+                          << ts.recall << ","
+                          << ts.staleRatio << ","
+                          << ts.aliveNodes << ","
+                          << ts.knownNodes << ","
+                          << ts.staleNodes
+                          << std::endl;
+            }
         }
     }
 
@@ -1381,7 +2018,9 @@ main(int argc, char* argv[])
     {
         double pdrMean = Mean(allPdr);
         double latMean = Mean(allLatency);
-        double ssMean = Mean(allSteadyBps);
+        double stxMean = Mean(allSteadyTx);
+        double srxMean = Mean(allSteadyRx);
+        double sohMean = Mean(allSteadyOverheadBps);
         double bsMean = Mean(allBootstrapBytes);
         double totMean = Mean(allTotalOverhead);
         double enrMean = Mean(allEnergy);
@@ -1390,6 +2029,10 @@ main(int argc, char* argv[])
         double gttMean = Mean(allGttAccuracy);
         double conMean = Mean(allConvergence);
         double rdMean = Mean(allRouteDiscovery);
+        double twpMean = Mean(allTwPrecision);
+        double twrMean = Mean(allTwRecall);
+        double slMean = Mean(allAvgStaleRatio);
+        double fdMean = Mean(allFirstDelivery);
 
         std::cout << std::fixed << std::setprecision(2);
         std::cout << protocol << ","
@@ -1400,7 +2043,9 @@ main(int argc, char* argv[])
                   << nRuns << ","
                   << pdrMean << "," << Ci95(allPdr, pdrMean) << ","
                   << latMean << "," << Ci95(allLatency, latMean) << ","
-                  << ssMean << "," << Ci95(allSteadyBps, ssMean) << ","
+                  << stxMean << "," << Ci95(allSteadyTx, stxMean) << ","
+                  << srxMean << "," << Ci95(allSteadyRx, srxMean) << ","
+                  << sohMean << "," << Ci95(allSteadyOverheadBps, sohMean) << ","
                   << bsMean << "," << Ci95(allBootstrapBytes, bsMean) << ","
                   << totMean << "," << Ci95(allTotalOverhead, totMean) << ","
                   << enrMean << "," << Ci95(allEnergy, enrMean) << ","
@@ -1408,7 +2053,11 @@ main(int argc, char* argv[])
                   << rxeMean << "," << Ci95(allRxEnergy, rxeMean) << ","
                   << gttMean << "," << Ci95(allGttAccuracy, gttMean) << ","
                   << conMean << "," << Ci95(allConvergence, conMean) << ","
-                  << rdMean << "," << Ci95(allRouteDiscovery, rdMean)
+                  << rdMean << "," << Ci95(allRouteDiscovery, rdMean) << ","
+                  << twpMean << "," << Ci95(allTwPrecision, twpMean) << ","
+                  << twrMean << "," << Ci95(allTwRecall, twrMean) << ","
+                  << slMean << "," << Ci95(allAvgStaleRatio, slMean) << ","
+                  << fdMean << "," << Ci95(allFirstDelivery, fdMean)
                   << std::endl;
     }
 

@@ -10,6 +10,7 @@
 #include "ns3/ipv4-address.h"
 #include "ns3/nstime.h"
 
+#include <algorithm>
 #include <iostream>
 #include <map>
 #include <vector>
@@ -18,6 +19,79 @@ namespace ns3
 {
 namespace tavrn
 {
+
+// ============================================================================
+// Entropy-Based Suffix Compression (ESC) helpers
+// ============================================================================
+
+/**
+ * @ingroup tavrn
+ * @brief Entropy-Based Suffix Compression (ESC) for TAVRN wire encoding.
+ *
+ * Inspired by IPHC (RFC 6282), ESC compresses L3 addresses on the wire
+ * using suffix bytes whose count is determined by the entropy of the GTT.
+ * The GTT serves as the shared context table (analogous to IPHC's context,
+ * but with a defined synchronization mechanism: mentorship + piggybacking).
+ *
+ * Each address field carries a 2-bit Address Mode (AM):
+ *   11 = 1-byte suffix  (k=1, /24 networks)
+ *   10 = 2-byte suffix  (k=2, /16 networks)
+ *   01 = 8-byte suffix  (k<=8, IPv6 IID)
+ *   00 = full address   (16B IPv6 / 4B IPv4)
+ *
+ * ns-3 implementation: uses k=1 (AM=11) for /24 simulation subnets.
+ * suffix = ip.Get() & 0xFF (last octet).  This is the correct ESC
+ * behavior for a /24 network, not a simplification.
+ */
+class CompressedEncoding
+{
+  public:
+    /// Set the network prefix (call once during RoutingProtocol::Start).
+    static void SetNetworkPrefix(Ipv4Address prefix);
+    /// Get the current network prefix.
+    static Ipv4Address GetNetworkPrefix();
+    /// Whether the prefix has been set (for test safety).
+    static bool IsInitialized();
+
+    /// Compress an IPv4 address to a 1-byte suffix (ESC k=1, AM=11).
+    static uint8_t IpToNodeId(Ipv4Address addr);
+    /// Expand a 1-byte suffix back to a full IPv4 address (ESC k=1, AM=11).
+    static Ipv4Address NodeIdToIp(uint8_t id);
+
+    /**
+     * @brief Encode a TTL (seconds) into a 4-bit bucket.
+     *
+     * bucket = min(15, ttl_seconds / 20).  Max encodable: 300s.
+     * Decode: ttl = bucket * 20.
+     */
+    static uint8_t EncodeTtlBucket(uint16_t ttlSeconds);
+    /// Decode a 4-bit TTL bucket back to seconds.
+    static uint16_t DecodeTtlBucket(uint8_t bucket);
+
+    /**
+     * @brief Encode a sequence number into 2 bytes (uint16_t).
+     *
+     * Takes the lower 16 bits.  Sequence numbers wrap naturally.
+     */
+    static uint16_t CompressSeqNo(uint32_t seqNo);
+    /// Expand a 2-byte sequence number back to uint32_t (zero-extended).
+    static uint32_t ExpandSeqNo(uint16_t compressed);
+
+    /**
+     * @brief Encode a lifetime in milliseconds into 2 bytes.
+     *
+     * Uses a non-linear encoding: values up to 16383ms are stored directly
+     * (bit 15 = 0).  Values above that use bit 15 = 1 and store
+     * (ms / 100) in bits 0-14, giving a max of ~3276.7 seconds.
+     */
+    static uint16_t EncodeLifetime(uint32_t lifetimeMs);
+    /// Decode a 2-byte lifetime back to milliseconds.
+    static uint32_t DecodeLifetime(uint16_t encoded);
+
+  private:
+    static uint32_t s_networkPrefix;  ///< Network prefix (host byte order)
+    static bool s_initialized;
+};
 
 /**
  * @ingroup tavrn
@@ -97,8 +171,10 @@ struct GttMetadataEntry
  * Appended to E_RREQ/E_RREP/E_RERR messages. Contains 0..N GTT metadata
  * entries for piggybacked topology information.
  *
- * Wire format:
- *   [1B count][N * (4B addr + 2B ttl + 1B flags)]
+ * Compressed wire format:
+ *   [1B count][N * (1B nodeId + 1B packed{4-bit TTL bucket | 4-bit flags})]
+ *   Entry: 2 bytes each (down from 7 bytes uncompressed).
+ *   TTL bucket: min(15, ttl_seconds / 20), max encodable 300s.
  */
 class TopologyMetadataHeader : public Header
 {
@@ -129,22 +205,13 @@ class TopologyMetadataHeader : public Header
  * @ingroup tavrn
  * @brief Enhanced Route Request header
  *
- *   AODV-compatible 23-byte wire format (RFC 3561):
- *   0                   1                   2
- *   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3
- *   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
- *   |     Flags     |   Reserved    |   Hop Count   |
- *   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
- *   |                       Request ID (4B)         |
- *   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
- *   |                   Destination IP Address                      |
- *   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
- *   |                 Destination Sequence Number                   |
- *   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
- *   |                   Originator IP Address                       |
- *   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
- *   |                 Originator Sequence Number                    |
- *   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ *   Compressed 10-byte wire format (802.15.4 optimized):
+ *   [1B flags][1B hopCount][2B requestID][1B dstNodeId]
+ *   [2B dstSeqNo][1B originNodeId][2B originSeqNo]
+ *
+ *   Addresses use 1-byte network-local node IDs.
+ *   Sequence numbers use lower 16 bits.
+ *   Request ID uses lower 16 bits.
  *
  * Topology metadata is carried in a separate TopologyMetadataHeader
  * appended after this header.
@@ -210,6 +277,10 @@ std::ostream& operator<<(std::ostream& os, const ERreqHeader& h);
 /**
  * @ingroup tavrn
  * @brief Enhanced Route Reply header
+ *
+ * Compressed 8-byte wire format (802.15.4 optimized):
+ *   [1B flags][1B hopCount][1B dstNodeId][2B dstSeqNo]
+ *   [1B originNodeId][2B lifetime]
  */
 class ERrepHeader : public Header
 {
@@ -266,6 +337,9 @@ std::ostream& operator<<(std::ostream& os, const ERrepHeader& h);
 /**
  * @ingroup tavrn
  * @brief Enhanced Route Error header
+ *
+ * Compressed wire format: [1B flags][N * (1B dstNodeId + 2B seqNo)]
+ * Size: 1 + 3N bytes (down from 3 + 8N).
  */
 class ERerrHeader : public Header
 {
@@ -305,8 +379,8 @@ std::ostream& operator<<(std::ostream& os, const ERerrHeader& h);
  * @ingroup tavrn
  * @brief HELLO message header for node join announcements
  *
- * Wire format:
- *   [4B nodeAddr][4B seqNo][1B flags]
+ * Compressed wire format:
+ *   [1B nodeId][2B seqNo][1B flags]  = 4 bytes (down from 9)
  * flags bit 0: isNew (first join announcement)
  */
 class HelloHeader : public Header
@@ -346,8 +420,9 @@ std::ostream& operator<<(std::ostream& os, const HelloHeader& h);
  * @ingroup tavrn
  * @brief SYNC_OFFER: Mentor offers topology sync to new node
  *
- * Wire format:
- *   [4B mentorAddr][4B gttSize]
+ * Compressed wire format:
+ *   [1B mentorNodeId][1B gttSize][1B menteeNodeId]  = 3 bytes (down from 12)
+ *   gttSize capped at 255 (sufficient for <254 node smart home mesh).
  */
 class SyncOfferHeader : public Header
 {
@@ -387,8 +462,9 @@ std::ostream& operator<<(std::ostream& os, const SyncOfferHeader& h);
  * @ingroup tavrn
  * @brief SYNC_PULL: Mentee requests topology page from mentor
  *
- * Wire format:
- *   [4B index][4B count]
+ * Compressed wire format:
+ *   [1B index][1B count]  = 2 bytes (down from 8)
+ *   Capped at 255 entries (sufficient for <254 node mesh).
  */
 class SyncPullHeader : public Header
 {
@@ -422,9 +498,11 @@ std::ostream& operator<<(std::ostream& os, const SyncPullHeader& h);
  * @ingroup tavrn
  * @brief SYNC_DATA: Mentor sends topology page
  *
- * Wire format:
- *   [4B startIndex][4B totalEntries][1B entryCount]
- *   [N * (4B addr + 4B lastSeen + 2B ttl)]
+ * Compressed wire format:
+ *   [1B startIndex][1B totalEntries][1B entryCount]
+ *   [N * (1B nodeId + 2B lastSeen + 1B ttlBucket + 2B seqNo + 1B hopCount)]
+ *   Entry: 7 bytes each (down from 15 bytes uncompressed).
+ *   Header overhead: 3 bytes (down from 9).
  */
 struct SyncDataEntry
 {
@@ -471,11 +549,13 @@ std::ostream& operator<<(std::ostream& os, const SyncDataHeader& h);
  * @ingroup tavrn
  * @brief TC-UPDATE: Broadcast on node join/leave events
  *
- * Wire format:
- *   [8B uuid (4B originAddr + 4B seqNo)][4B subjectAddr][1B eventType][4B timestamp]
+ * Compressed wire format:
+ *   [1B originNodeId][2B seqNo][1B subjectNodeId][1B eventType][2B timestamp]
+ *   = 7 bytes (down from 17).
  *
  * UUID = (originAddr, seqNo) - 64-bit unique identifier per spec
  * eventType: 0 = join, 1 = leave
+ * Timestamp uses 2B (seconds, max ~18 hours, sufficient for simulation).
  */
 class TcUpdateHeader : public Header
 {

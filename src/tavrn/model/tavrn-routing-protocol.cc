@@ -195,7 +195,7 @@ RoutingProtocol::RoutingProtocol()
       m_ttlThreshold(7),
       m_rreqRateLimit(10),
       m_rerrRateLimit(10),
-      m_activeRouteTimeout(Seconds(600)),
+      m_activeRouteTimeout(Seconds(360)),
       m_netDiameter(35),
       m_nodeTraversalTime(MilliSeconds(40)),
       m_netTraversalTime(Time(2 * m_netDiameter * m_nodeTraversalTime)),
@@ -211,24 +211,24 @@ RoutingProtocol::RoutingProtocol()
       m_nextHopWait(MilliSeconds(50)),
       m_blackListTimeout(Time(m_rreqRetries * Time(2 * m_netDiameter * m_nodeTraversalTime))),
       m_gttTtl(Seconds(300)),
-      m_enableAdaptiveGttTtl(false),
-      m_gttTtlMin(Seconds(60)),
-      m_gttTtlMax(Seconds(300)),
-      m_gttAlpha(0.7),
+      m_helloIntervalMin(Seconds(24)),
+      m_helloIntervalMax(Seconds(120)),
+      m_helloAlpha(0.8),
       m_lastNeighborCount(0),
+      m_livenessFloor(Seconds(0)),
       m_softExpiryThreshold(0.5),
       m_enablePeriodicHello(true),
-      m_helloInterval(Seconds(150)),
+      m_helloInterval(Seconds(24)),
       m_syncPageSize(15),
-      m_maxMetadataEntries(5),
+      m_maxMetadataEntries(4),
       m_piggybackCooldown(Seconds(5)),
       m_tcUpdateExpiryWindow(Seconds(30)),
       m_gtt(Seconds(300), 0.5),
-      m_routingTable(Seconds(600)),
+      m_routingTable(Seconds(360)),
       m_queue(64, Seconds(30)),
       m_rreqIdCache(Seconds(2)),
       m_tcUuidCache(Seconds(30)),        // separate UUID cache with longer lifetime
-      m_nb(Seconds(600)),
+      m_nb(Seconds(360)),
       m_dpd(Seconds(2)),
       m_requestId(0),
       m_seqNo(0),
@@ -285,9 +285,8 @@ RoutingProtocol::GetTypeId()
                           MakeUintegerChecker<uint16_t>())
             .AddAttribute("ActiveRouteTimeout",
                           "Period of time during which a route is considered valid. "
-                          "Derived: 2x current GttTtl. With adaptive TTL, starts at "
-                          "2x GttTtlMin and grows as the global TTL grows.",
-                          TimeValue(Seconds(600)),
+                          "Derived: 1.2x GttTtl (static). Default: 360s.",
+                          TimeValue(Seconds(360)),
                           MakeTimeAccessor(&RoutingProtocol::m_activeRouteTimeout),
                           MakeTimeChecker())
             .AddAttribute("NetDiameter",
@@ -322,33 +321,27 @@ RoutingProtocol::GetTypeId()
                 MakeBooleanAccessor(&RoutingProtocol::m_gratuitousReply),
                 MakeBooleanChecker())
             .AddAttribute("GttTtl",
-                          "GTT entry time-to-live. With adaptive TTL, this is the "
-                          "initial value (= GttTtlMin). Without adaptive TTL, static.",
+                          "GTT entry time-to-live (static). Default: 300s.",
                           TimeValue(Seconds(300)),
                           MakeTimeAccessor(&RoutingProtocol::m_gttTtl),
                           MakeTimeChecker())
-            .AddAttribute("EnableAdaptiveGttTtl",
-                          "Whether the global GTT TTL adapts: starts at GttTtlMin, "
-                          "grows toward GttTtlMax via EMA as topology stabilizes, "
-                          "resets to GttTtlMin on neighbor gain/loss.",
-                          BooleanValue(false),
-                          MakeBooleanAccessor(&RoutingProtocol::m_enableAdaptiveGttTtl),
-                          MakeBooleanChecker())
-            .AddAttribute("GttTtlMin",
-                          "Minimum (fast-mode) GTT TTL during bootstrap/churn.",
-                          TimeValue(Seconds(60)),
-                          MakeTimeAccessor(&RoutingProtocol::m_gttTtlMin),
+            .AddAttribute("HelloIntervalMin",
+                          "Minimum (fast) HELLO interval during bootstrap/churn. "
+                          "HELLO resets here on neighbor topology change. Default: 24s.",
+                          TimeValue(Seconds(24)),
+                          MakeTimeAccessor(&RoutingProtocol::m_helloIntervalMin),
                           MakeTimeChecker())
-            .AddAttribute("GttTtlMax",
-                          "Maximum (steady-state) GTT TTL ceiling.",
-                          TimeValue(Seconds(300)),
-                          MakeTimeAccessor(&RoutingProtocol::m_gttTtlMax),
+            .AddAttribute("HelloIntervalMax",
+                          "Maximum (steady-state) HELLO interval. "
+                          "HELLO grows toward this via EMA. Default: 120s.",
+                          TimeValue(Seconds(120)),
+                          MakeTimeAccessor(&RoutingProtocol::m_helloIntervalMax),
                           MakeTimeChecker())
-            .AddAttribute("GttAlpha",
-                          "EMA smoothing factor for adaptive TTL growth. "
-                          "Higher = slower growth. Range (0, 1).",
-                          DoubleValue(0.7),
-                          MakeDoubleAccessor(&RoutingProtocol::m_gttAlpha),
+            .AddAttribute("HelloAlpha",
+                          "EMA smoothing factor for HELLO interval growth. "
+                          "Higher = slower growth toward max. Range (0, 1). Default: 0.8.",
+                          DoubleValue(0.8),
+                          MakeDoubleAccessor(&RoutingProtocol::m_helloAlpha),
                           MakeDoubleChecker<double>(0.01, 0.99))
             .AddAttribute("SoftExpiryThreshold",
                           "Fraction of GTT-TTL at which soft expiry triggers freshness request.",
@@ -362,10 +355,11 @@ RoutingProtocol::GetTypeId()
                           MakeBooleanAccessor(&RoutingProtocol::m_enablePeriodicHello),
                           MakeBooleanChecker())
             .AddAttribute("HelloInterval",
-                          "Interval between periodic HELLO broadcasts. "
-                          "Derived: 0.5 * current GttTtl. With adaptive TTL, "
-                          "starts at 0.5 * GttTtlMin and grows automatically.",
-                          TimeValue(Seconds(150)),
+                          "Current HELLO broadcast interval. Managed by EMA-based "
+                          "adaptive logic (starts at HelloIntervalMin, grows toward "
+                          "HelloIntervalMax). Setting this manually overrides the "
+                          "initial value but EMA will still adjust it at runtime.",
+                          TimeValue(Seconds(24)),
                           MakeTimeAccessor(&RoutingProtocol::m_helloInterval),
                           MakeTimeChecker())
             .AddAttribute("SyncPageSize",
@@ -375,7 +369,7 @@ RoutingProtocol::GetTypeId()
                           MakeUintegerChecker<uint32_t>())
             .AddAttribute("MaxMetadataEntries",
                           "Maximum GTT metadata entries piggybacked per message.",
-                          UintegerValue(5),
+                          UintegerValue(4),
                           MakeUintegerAccessor(&RoutingProtocol::m_maxMetadataEntries),
                           MakeUintegerChecker<uint8_t>())
             .AddAttribute("PiggybackCooldown",
@@ -529,12 +523,9 @@ RoutingProtocol::DoInitialize()
     // Sync GTT parameters with attributes (in case they were changed via Config)
     m_gtt.SetSoftExpiryThreshold(m_softExpiryThreshold);
 
-    // Initialize adaptive GTT TTL: start at TTL_min, derive all timers
-    if (m_enableAdaptiveGttTtl)
-    {
-        m_gttTtl = m_gttTtlMin;
-        m_lastNeighborCount = 0;
-    }
+    // Initialize adaptive HELLO: start at fast interval
+    m_helloInterval = m_helloIntervalMin;
+    m_lastNeighborCount = 0;
     RecalcDerivedTimers();
 
     if (m_enablePeriodicHello)
@@ -692,6 +683,12 @@ RoutingProtocol::NotifyInterfaceUp(uint32_t i)
     // Trigger initial HELLO on first real (non-loopback) interface up
     if (m_socketAddresses.size() == 1)
     {
+        // Initialize compressed wire encoding with this node's network prefix
+        if (!CompressedEncoding::IsInitialized())
+        {
+            CompressedEncoding::SetNetworkPrefix(iface.GetLocal());
+        }
+
         // Add self to GTT
         m_gtt.AddOrUpdateEntry(iface.GetLocal(), m_seqNo, 0);
         Simulator::Schedule(MilliSeconds(m_uniformRandomVariable->GetInteger(0, 100)),
@@ -1048,6 +1045,8 @@ RoutingProtocol::RouteInput(Ptr<const Packet> p,
         {
             m_gtt.AddOrUpdateEntry(prevHop, 0, 1);
         }
+        // GTT-informed route keepalive: previous hop is confirmed alive
+        UpdateRouteLifeTime(prevHop, m_activeRouteTimeout);
     }
 
     // Improvement 3: Passive learning — source IP is alive (from IP header)
@@ -1062,6 +1061,8 @@ RoutingProtocol::RouteInput(Ptr<const Packet> p,
         {
             m_gtt.AddOrUpdateEntry(origin, 0, 0); // hop count unknown for multi-hop source
         }
+        // GTT-informed route keepalive: origin is confirmed alive
+        UpdateRouteLifeTime(origin, m_activeRouteTimeout);
     }
 
     // Duplicate of own packet
@@ -1945,15 +1946,20 @@ RoutingProtocol::SendRequest(Ipv4Address dst)
             else
             {
                 GttEntry gttDst;
+                // Relax TtlRemaining check for verification targets: the GTT entry
+                // is hard-expired but the hop count is still a valid estimate.
+                bool isVerifying = m_verificationState.count(dst) > 0;
                 if (m_gtt.LookupEntry(dst, gttDst) && gttDst.hopCount > 0 &&
-                    !gttDst.departed && m_gtt.TtlRemaining(dst).GetSeconds() > 0)
+                    !gttDst.departed &&
+                    (m_gtt.TtlRemaining(dst).GetSeconds() > 0 || isVerifying))
                 {
                     // Smart TTL: hop count + 2 buffer for topology changes
                     ttl = std::min<uint16_t>(gttDst.hopCount + 2, m_netDiameter);
                     m_smartTtlUsed.insert(dst);
                     NS_LOG_DEBUG("GTT-Assisted RREQ: dst=" << dst
                                  << " gttHops=" << gttDst.hopCount
-                                 << " smartTtl=" << ttl);
+                                 << " smartTtl=" << ttl
+                                 << (isVerifying ? " (verification)" : ""));
                 }
                 else
                 {
@@ -1987,16 +1993,20 @@ RoutingProtocol::SendRequest(Ipv4Address dst)
     {
         // First discovery attempt — no route exists yet.
         // Check GTT for a smart initial TTL before falling back to ERS.
-        // Only trust non-expired GTT entries (TtlRemaining > 0).
+        // Relax TtlRemaining check for verification targets (hard-expired but
+        // hop count still valid).
         GttEntry gttDst;
+        bool isVerifying = m_verificationState.count(dst) > 0;
         if (m_gtt.LookupEntry(dst, gttDst) && gttDst.hopCount > 0 &&
-            !gttDst.departed && m_gtt.TtlRemaining(dst).GetSeconds() > 0)
+            !gttDst.departed &&
+            (m_gtt.TtlRemaining(dst).GetSeconds() > 0 || isVerifying))
         {
             ttl = std::min<uint16_t>(gttDst.hopCount + 2, m_netDiameter);
             m_smartTtlUsed.insert(dst);
             NS_LOG_DEBUG("GTT-Assisted first RREQ: dst=" << dst
                          << " gttHops=" << gttDst.hopCount
-                         << " smartTtl=" << ttl);
+                         << " smartTtl=" << ttl
+                         << (isVerifying ? " (verification)" : ""));
         }
         // else ttl stays at m_ttlStart (standard ERS start)
 
@@ -2488,11 +2498,15 @@ RoutingProtocol::RecvHello(Ptr<Packet> p, Ipv4Address src)
     // Add/update sender in GTT
     m_gtt.AddOrUpdateEntry(nodeAddr, helloHeader.GetSeqNo(), 1);
 
-    // Use allowedHelloLoss * helloInterval for neighbor expiry when periodic HELLO
-    // is enabled. Otherwise fall back to activeRouteTimeout.
-    Time neighborExpiry = m_enablePeriodicHello
-        ? Time(m_allowedHelloLoss * m_helloInterval)
-        : m_activeRouteTimeout;
+    // GTT-informed route keepalive: HELLO proves the neighbor is alive,
+    // so extend the route lifetime for this node and its next-hop.
+    UpdateRouteLifeTime(nodeAddr, m_activeRouteTimeout);
+
+    // Neighbor expiry is tied to GTT TTL (via ActiveRouteTimeout = 1.2 * GttTtl),
+    // NOT to HelloInterval.  HELLOs exist to keep direct-neighbor GTT entries
+    // fresh, preventing unnecessary soft-expiry freshness requests.  Neighbor
+    // liveness is determined by the GTT, not by missed HELLOs.
+    Time neighborExpiry = m_activeRouteTimeout;
     m_nb.Update(src, neighborExpiry);
 
     // Record real RSSI from PHY sniffer for 1-hop neighbor
@@ -3030,31 +3044,15 @@ RoutingProtocol::RecvTcUpdate(Ptr<Packet> p, Ipv4Address src)
         if (!m_gtt.LookupEntry(subject, existing))
         {
             m_gtt.AddOrUpdateEntry(subject, 0, 0);
-            // Tier 2: New remote node gets fast-tracked with TTL_min
-            if (m_enableAdaptiveGttTtl)
-            {
-                m_gtt.SetPerNodeTtl(subject, m_gttTtlMin);
-            }
         }
         else
         {
             m_gtt.RefreshEntry(subject, existing.seqNo);
-            // Tier 2: If node was departed and got resurrected, fast-track it
-            if (m_enableAdaptiveGttTtl && existing.departed)
-            {
-                m_gtt.SetPerNodeTtl(subject, m_gttTtlMin);
-            }
         }
     }
     else // NODE_LEAVE
     {
         m_gtt.MarkDeparted(subject);
-
-        // Tier 2 adaptive TTL: if the subject is a remote (non-neighbor) node,
-        // DON'T reset the global TTL — only snap that entry's per-node TTL to
-        // TTL_min for surgical fast-verification if it's later resurrected.
-        // (If it's a direct neighbor, the global TTL reset will be triggered
-        // by the neighbor count change detection in GttMaintenanceTimerExpire.)
     }
 
     // Fire convergence trace
@@ -3326,10 +3324,12 @@ RoutingProtocol::ProcessTopologyMetadata(const TopologyMetadataHeader& meta, Ipv
 
         // Always update GTT if the received info might be fresher
         GttEntry existing;
+        bool refreshed = false;
         if (!m_gtt.LookupEntry(mde.nodeAddr, existing))
         {
             // New node — add it
             m_gtt.AddOrUpdateEntry(mde.nodeAddr, 0, 0);
+            refreshed = true;
         }
         else
         {
@@ -3339,7 +3339,17 @@ RoutingProtocol::ProcessTopologyMetadata(const TopologyMetadataHeader& meta, Ipv
             if (theirRemaining > ourRemaining)
             {
                 m_gtt.RefreshEntry(mde.nodeAddr, existing.seqNo);
+                refreshed = true;
             }
+        }
+
+        // GTT-informed route keepalive: if the GTT confirms a node is still
+        // alive (via piggybacked metadata), extend the route lifetime too.
+        // This prevents unnecessary route expiry and rediscovery when the
+        // GTT already has proof of liveness.
+        if (refreshed)
+        {
+            UpdateRouteLifeTime(mde.nodeAddr, m_activeRouteTimeout);
         }
     }
 }
@@ -3364,6 +3374,30 @@ RoutingProtocol::SendFreshnessResponse(Ipv4Address requester, Ipv4Address subjec
         return;
     }
 
+    // Determine TTL based on distance to requester.
+    // For 1-hop neighbors (normal soft-expiry responses): TTL=1 suffices.
+    // For multi-hop requesters (verification response): need hop-appropriate TTL.
+    // If no route exists, don't send — avoid triggering an RREQ just for a
+    // freshness response.
+    uint8_t responseTtl = 1;
+    if (!m_nb.IsNeighbor(requester))
+    {
+        RoutingTableEntry toRequester;
+        if (m_routingTable.LookupValidRoute(requester, toRequester))
+        {
+            responseTtl = std::min<uint8_t>(
+                static_cast<uint8_t>(toRequester.GetHop() + 2),
+                static_cast<uint8_t>(m_netDiameter));
+        }
+        else
+        {
+            // No route to multi-hop requester — can't respond without RREQ
+            NS_LOG_DEBUG("Cannot send freshness response to " << requester
+                         << " — no route (multi-hop, not neighbor)");
+            return;
+        }
+    }
+
     auto j = m_socketAddresses.begin();
     Ptr<Socket> socket = j->first;
     Ipv4InterfaceAddress iface = j->second;
@@ -3382,7 +3416,7 @@ RoutingProtocol::SendFreshnessResponse(Ipv4Address requester, Ipv4Address subjec
 
     Ptr<Packet> packet = Create<Packet>();
     SocketIpTtlTag tag;
-    tag.SetTtl(1);
+    tag.SetTtl(responseTtl);
     packet->AddPacketTag(tag);
     packet->AddHeader(meta);        // Piggyback subject's fresh data
     packet->AddHeader(helloHeader);
@@ -3394,7 +3428,87 @@ RoutingProtocol::SendFreshnessResponse(Ipv4Address requester, Ipv4Address subjec
 }
 
 // ============================================================================
-// CheckGttExpiry — GTT maintenance
+// SendVerificationUnicast — Cheap unicast verification via existing route.
+//
+// When a GTT entry hard-expires at t=GttTtl, the route is still valid until
+// t=1.2×GttTtl (ActiveRouteTimeout = 1.2 × GttTtl).  We use that route to
+// send a targeted HELLO with FLAG_FRESHNESS_REQUEST to the expired node.
+// The target responds via SendFreshnessResponse, confirming liveness.
+//
+// Cost: ~33 bytes × path_length (unicast, each hop forwards once).
+// vs RREQ flood: ~73 bytes × N nodes (broadcast storm).
+// ============================================================================
+
+bool
+RoutingProtocol::SendVerificationUnicast(Ipv4Address target)
+{
+    NS_LOG_FUNCTION(this << target);
+
+    // Must have a valid route — this is the whole point of stage 0
+    RoutingTableEntry rtEntry;
+    if (!m_routingTable.LookupValidRoute(target, rtEntry))
+    {
+        return false;
+    }
+
+    GttEntry gttEntry;
+    if (!m_gtt.LookupEntry(target, gttEntry))
+    {
+        return false;
+    }
+    if (m_socketAddresses.empty())
+    {
+        return false;
+    }
+
+    auto j = m_socketAddresses.begin();
+    Ptr<Socket> socket = j->first;
+    Ipv4InterfaceAddress iface = j->second;
+
+    // Build metadata with FLAG_FRESHNESS_REQUEST for the target.
+    // The target's RecvHello → ProcessTopologyMetadata → Tier 1 ("I AM the
+    // target") → SendFreshnessResponse back to us.
+    TopologyMetadataHeader meta;
+    GttMetadataEntry mde;
+    mde.nodeAddr = target;
+    Time remaining = gttEntry.ttlExpiry - Simulator::Now();
+    mde.ttlRemaining = static_cast<uint16_t>(std::max(0.0, remaining.GetSeconds()));
+    mde.flags = GttMetadataEntry::FLAG_FRESHNESS_REQUEST;
+    meta.AddEntry(mde);
+
+    // Build unicast HELLO with piggybacked freshness request.
+    // TTL must be high enough for multi-hop (not TTL=1 like broadcast HELLOs).
+    HelloHeader helloHeader(iface.GetLocal(), m_seqNo, false);
+
+    Ptr<Packet> packet = Create<Packet>();
+    SocketIpTtlTag tag;
+    tag.SetTtl(std::min<uint16_t>(rtEntry.GetHop() + 2, m_netDiameter));
+    packet->AddPacketTag(tag);
+    packet->AddHeader(meta);
+    packet->AddHeader(helloHeader);
+    TypeHeader tHeader(TAVRN_HELLO);
+    packet->AddHeader(tHeader);
+
+    m_controlOverheadTrace(packet->GetSize());
+    socket->SendTo(packet, 0, InetSocketAddress(target, TAVRN_PORT));
+
+    NS_LOG_DEBUG("Stage 0: unicast verification for " << target
+                 << " via route (hops=" << rtEntry.GetHop()
+                 << ", TTL remaining=" << mde.ttlRemaining << "s)");
+    return true;
+}
+
+// ============================================================================
+// CheckGttExpiry — GTT maintenance with multi-stage verification
+//
+// When a GTT entry hard-expires (at GttTtl), the route is still valid for
+// 0.2 × GttTtl longer (ActiveRouteTimeout = 1.2 × GttTtl).  We exploit
+// this window for cheap unicast verification before falling back to RREQ.
+//
+// Stage 0: Unicast HELLO via valid route → target responds.  O(path_length).
+// Stage 1: RREQ with Smart TTL → ERS.  O(targeted) → O(network).
+//          SendRequest handles its own retries via ScheduleRreqRetry.
+// Give up: Mark departed, TC-UPDATE(LEAVE).
 // ============================================================================
 
 void
@@ -3409,7 +3523,7 @@ RoutingProtocol::CheckGttExpiry()
         myAddr = m_socketAddresses.begin()->second.GetLocal();
     }
 
-    // Get hard-expired entries and send verification E_RREQ for each
+    // Get hard-expired entries and handle verification
     std::vector<GttEntry> hardExpired = m_gtt.GetHardExpiredEntries();
     for (const auto& entry : hardExpired)
     {
@@ -3419,82 +3533,113 @@ RoutingProtocol::CheckGttExpiry()
             continue;
         }
 
-        // Route-check bypass: if ActiveRouteTimeout > GttTtl, a valid route
-        // proves the node is still reachable. Refresh GTT silently instead of
-        // flooding a verification E_RREQ. Only flood when the route itself is
-        // gone — natural graceful degradation.
-        RoutingTableEntry rtEntry;
-        if (m_routingTable.LookupValidRoute(entry.nodeAddr, rtEntry))
+        // ---------------------------------------------------------------
+        // Demand check FIRST — before any route or verification logic.
+        // If nobody needs this node, let it expire silently regardless
+        // of whether a route exists.  A future RREQ will rediscover AND
+        // refresh the GTT entry in one shot if demand appears later.
+        // ---------------------------------------------------------------
+        bool hasDemand = m_queue.Find(entry.nodeAddr);
+        if (!hasDemand)
         {
+            // Check if this node is used as a gateway by any active route
+            std::map<Ipv4Address, uint32_t> affectedDsts;
+            m_routingTable.GetListOfDestinationWithNextHop(entry.nodeAddr, affectedDsts);
+            hasDemand = !affectedDsts.empty();
+        }
+
+        if (!hasDemand)
+        {
+            // No active interest — expire silently.
             NS_LOG_DEBUG("GTT hard-expired for " << entry.nodeAddr
-                         << " but valid route exists (via " << rtEntry.GetNextHop()
-                         << "). Refreshing GTT silently.");
-            m_gtt.AddOrUpdateEntry(entry.nodeAddr, entry.seqNo, rtEntry.GetHop());
+                         << " — no demand. Expiring silently.");
+            m_gtt.MarkDeparted(entry.nodeAddr);
+            m_verificationState.erase(entry.nodeAddr);
             continue;
         }
 
-        NS_LOG_DEBUG("Hard-expired GTT entry for " << entry.nodeAddr
-                     << ". No valid route — checking verification state.");
-
-        // Per-entry verification with probe-based retries (not tick-based)
+        // ---------------------------------------------------------------
+        // Multi-stage verification for entries with active demand.
+        // ---------------------------------------------------------------
         auto vit = m_verificationState.find(entry.nodeAddr);
         if (vit == m_verificationState.end())
         {
-            // First time seeing this entry hard-expired — only start verification
-            // if we can actually send the probe (rate limit allows it)
-            if (m_rreqCount < m_rreqRateLimit)
-            {
-                VerificationInfo vi;
-                vi.firstVerifyTime = Simulator::Now();
-                vi.lastProbeTime = Simulator::Now();
-                vi.retryCount = 1; // this probe counts as first attempt
-                m_verificationState[entry.nodeAddr] = vi;
+            // First time seeing this hard-expired entry with demand.
+            // Try stage 0: unicast verification via the still-valid route.
+            VerificationInfo vi;
+            vi.firstVerifyTime = Simulator::Now();
+            vi.lastProbeTime = Simulator::Now();
+            vi.retryCount = 1;
+            vi.stage = 0;
+            vi.ersCapped = false;
 
-                NS_LOG_DEBUG("Starting verification for " << entry.nodeAddr);
-                SendRequest(entry.nodeAddr);
+            if (SendVerificationUnicast(entry.nodeAddr))
+            {
+                // Route was valid — unicast sent (cheapest path)
+                m_verificationState[entry.nodeAddr] = vi;
             }
-            // else: rate-limited, skip this cycle — do NOT create state without sending
+            else
+            {
+                // No valid route — skip to stage 1 (RREQ with Smart TTL)
+                if (m_rreqCount < m_rreqRateLimit)
+                {
+                    vi.stage = 1;
+                    m_verificationState[entry.nodeAddr] = vi;
+                    NS_LOG_DEBUG("Stage 1 (no route for unicast): RREQ for " << entry.nodeAddr);
+                    SendRequest(entry.nodeAddr);
+                }
+                // else: rate-limited, skip — do NOT create state without sending
+            }
         }
         else
         {
-            // Already tracking verification — check if last probe timed out
+            // Already tracking verification — check if last probe timed out.
+            // The maintenance interval (gttTtl/12 ≈ 5-25s) far exceeds both
+            // the unicast RTT (~560ms) and the full RREQ process (~1.6s),
+            // so by the time we re-check, the previous stage has completed.
             Time sinceLast = Simulator::Now() - vit->second.lastProbeTime;
 
             if (sinceLast < 2 * m_netTraversalTime)
             {
-                // Still waiting for response from the last probe — do nothing
+                // Still waiting — should be rare given maintenance interval
                 continue;
             }
 
-            // Last probe timed out
-            if (vit->second.retryCount >= 2)
+            uint8_t currentStage = vit->second.stage;
+
+            if (currentStage == 0)
             {
-                // No response after bounded retries — mark departed
+                // Stage 0 (unicast) timed out — advance to stage 1 (RREQ).
+                // RREQ uses Smart TTL first, then ERS via ScheduleRreqRetry.
+                if (m_rreqCount < m_rreqRateLimit)
+                {
+                    vit->second.stage = 1;
+                    vit->second.retryCount++;
+                    vit->second.lastProbeTime = Simulator::Now();
+                    NS_LOG_DEBUG("Stage 1: RREQ for " << entry.nodeAddr
+                                 << " (attempt " << vit->second.retryCount << ")");
+                    SendRequest(entry.nodeAddr);
+                }
+                // else: rate-limited, retry next cycle
+            }
+            else
+            {
+                // Stage 1 (RREQ + retries) had time to complete — give up.
                 NS_LOG_DEBUG("Verification failed for " << entry.nodeAddr
                              << " after " << vit->second.retryCount
-                             << " probes. Marking departed.");
-                // Only send TC-UPDATE if state actually changed
+                             << " probes (stage " << static_cast<int>(currentStage)
+                             << "). Marking departed.");
                 if (m_gtt.MarkDeparted(entry.nodeAddr))
                 {
                     SendTcUpdate(entry.nodeAddr, TcUpdateHeader::NODE_LEAVE);
                 }
                 m_verificationState.erase(vit);
             }
-            else if (m_rreqCount < m_rreqRateLimit)
-            {
-                // Retry verification — only increment if we actually send
-                vit->second.retryCount++;
-                vit->second.lastProbeTime = Simulator::Now();
-                NS_LOG_DEBUG("Retry verification for " << entry.nodeAddr
-                             << " (attempt " << vit->second.retryCount << ")");
-                SendRequest(entry.nodeAddr);
-            }
-            // else: rate-limited, skip — counter not incremented
         }
     }
 
     // Clean up verification state for entries that are no longer hard-expired
-    // (they got refreshed before we gave up)
+    // (they got refreshed by a freshness response or RREP before we gave up)
     for (auto vit = m_verificationState.begin(); vit != m_verificationState.end();)
     {
         GttEntry e;
@@ -3531,6 +3676,21 @@ RoutingProtocol::HelloTimerExpire()
     {
         SendHello();
     }
+
+    // --- Adaptive HELLO: grow interval toward max via EMA ---
+    if (m_enablePeriodicHello)
+    {
+        double curSec = m_helloInterval.GetSeconds();
+        double maxSec = m_helloIntervalMax.GetSeconds();
+        double newSec = m_helloAlpha * curSec + (1.0 - m_helloAlpha) * maxSec;
+        if (newSec >= maxSec * 0.95)
+        {
+            newSec = maxSec; // snap to ceiling
+        }
+        m_helloInterval = Seconds(newSec);
+        NS_LOG_DEBUG("Adaptive HELLO: interval grew to " << m_helloInterval.As(Time::S));
+    }
+
     m_htimer.Cancel();
     Time diff = m_helloInterval - offset;
     m_htimer.Schedule(std::max(Seconds(0), diff));
@@ -3550,66 +3710,47 @@ RoutingProtocol::GttMaintenanceTimerExpire()
         m_gtt.RefreshEntry(myAddr, m_seqNo);
     }
 
-    // --- Adaptive GTT TTL: Tier 1 (Global) ---
-    if (m_enableAdaptiveGttTtl)
+    // --- Detect neighbor count change → reset HELLO interval to fast ---
     {
-        // Detect neighbor count change since last cycle
         uint32_t currentNeighborCount = 0;
+        for (const auto& nb : m_nb.GetNeighborList())
         {
-            // Count active neighbors via the neighbor table's list
-            // (Neighbors doesn't expose a count method, so we use m_nb.IsNeighbor
-            // iteratively — but we already track the snapshot)
-            auto nodes = m_gtt.EnumerateNodes();
-            for (const auto& addr : nodes)
+            if (nb.m_expireTime > Simulator::Now())
             {
-                if (m_nb.IsNeighbor(addr))
-                {
-                    ++currentNeighborCount;
-                }
+                ++currentNeighborCount;
             }
         }
 
         bool neighborChanged = (currentNeighborCount != m_lastNeighborCount);
         m_lastNeighborCount = currentNeighborCount;
 
-        if (neighborChanged)
+        if (neighborChanged && m_enablePeriodicHello)
         {
-            // Structural change — reset global TTL to fast mode
-            ResetGlobalGttTtl();
-            NS_LOG_DEBUG("Adaptive GTT: neighbor change detected ("
+            // Preserve the old liveness threshold as a floor so that neighbors
+            // who were silent (validly) under the old slow cadence are not
+            // falsely declared departed when the interval shrinks.
+            Time oldThreshold = 3 * m_helloInterval;
+            if (oldThreshold > m_livenessFloor)
+            {
+                m_livenessFloor = oldThreshold;
+            }
+
+            // Structural change — reset HELLO to fast mode for rapid re-convergence
+            m_helloInterval = m_helloIntervalMin;
+            NS_LOG_DEBUG("Adaptive HELLO: neighbor change detected ("
                          << currentNeighborCount << " neighbors). "
-                         << "Global TTL reset to " << m_gttTtl.As(Time::S));
-        }
-        else
-        {
-            // No neighbor change — grow global TTL toward max via EMA
-            double oldSec = m_gttTtl.GetSeconds();
-            double maxSec = m_gttTtlMax.GetSeconds();
-            double newSec = m_gttAlpha * oldSec + (1.0 - m_gttAlpha) * maxSec;
+                         << "HELLO interval reset to " << m_helloInterval.As(Time::S)
+                         << ", liveness floor preserved at " << m_livenessFloor.As(Time::S));
 
-            if (newSec >= maxSec * 0.95)
-            {
-                newSec = maxSec; // snap to ceiling
-            }
-
-            if (newSec != oldSec)
-            {
-                m_gttTtl = Seconds(newSec);
-                RecalcDerivedTimers();
-                NS_LOG_DEBUG("Adaptive GTT: stable cycle. Global TTL grew to "
-                             << m_gttTtl.As(Time::S));
-            }
-        }
-
-        // --- Tier 2: Grow per-node TTLs toward current global TTL ---
-        auto allNodes = m_gtt.EnumerateNodes();
-        for (const auto& addr : allNodes)
-        {
-            m_gtt.GrowPerNodeTtl(addr, m_gttAlpha);
+            // Fix: immediately reschedule HELLO timer so fast mode takes effect
+            // now, not when the old (potentially 100+ second) timer fires.
+            m_htimer.Cancel();
+            m_htimer.Schedule(m_helloIntervalMin);
         }
     }
 
     CheckGttExpiry();
+    CheckNeighborLiveness();
 
     // Reschedule: check proportionally to TTL to preserve radio silence in long-TTL networks
     Time interval = std::max(Seconds(1), m_gttTtl / 12);
@@ -3617,27 +3758,86 @@ RoutingProtocol::GttMaintenanceTimerExpire()
 }
 
 // ============================================================================
-// ResetGlobalGttTtl — snap global TTL to min on neighbor topology change
+// CheckNeighborLiveness — detect silent neighbor departures via HELLO absence
 // ============================================================================
 
 void
-RoutingProtocol::ResetGlobalGttTtl()
+RoutingProtocol::CheckNeighborLiveness()
 {
     NS_LOG_FUNCTION(this);
 
-    m_gttTtl = m_gttTtlMin;
+    if (!m_enablePeriodicHello)
+    {
+        return;
+    }
 
-    // Clamp all per-node TTLs to be <= new global TTL BEFORE updating
-    // the GTT default TTL (RecalcDerivedTimers calls SetDefaultTtl),
-    // so entries with perNodeTtl == 0 are correctly evaluated against
-    // the old default before it changes.
-    m_gtt.ClampAllPerNodeTtls(m_gttTtlMin);
+    Ipv4Address myAddr;
+    if (!m_socketAddresses.empty())
+    {
+        myAddr = m_socketAddresses.begin()->second.GetLocal();
+    }
 
-    RecalcDerivedTimers();
+    // Liveness timeout: if we haven't heard from a neighbor in 3 × current HELLO interval,
+    // they are presumed dead. This catches silent failures where no MAC error fires
+    // because no traffic was being sent TO that neighbor.
+    //
+    // Hysteresis: when HELLO interval resets (120s→24s), the threshold would shrink
+    // from 360s to 72s, falsely declaring healthy neighbors departed. Use the
+    // liveness floor (preserved from the pre-reset interval) as a lower bound.
+    Time livenessTimeout = std::max(3 * m_helloInterval, m_livenessFloor);
+    Time now = Simulator::Now();
+
+    // Decay the liveness floor toward the current interval's threshold.
+    // This ensures the floor isn't permanent — once enough time passes at the
+    // new cadence, the floor naturally drops to the current 3×interval.
+    Time currentThreshold = 3 * m_helloInterval;
+    if (m_livenessFloor > currentThreshold)
+    {
+        // Decay by half the difference each maintenance cycle
+        Time diff = m_livenessFloor - currentThreshold;
+        m_livenessFloor = m_livenessFloor - diff / 2;
+        if (m_livenessFloor < currentThreshold * 1.05)
+        {
+            m_livenessFloor = Seconds(0); // close enough — snap to zero
+        }
+    }
+
+    for (const auto& nb : m_nb.GetNeighborList())
+    {
+        if (nb.m_neighborAddress == myAddr)
+        {
+            continue;
+        }
+
+        // Look up the GTT entry to check lastSeen time
+        GttEntry gttEntry;
+        if (!m_gtt.LookupEntry(nb.m_neighborAddress, gttEntry))
+        {
+            continue; // Not in GTT — skip
+        }
+        if (gttEntry.departed)
+        {
+            continue; // Already departed — skip
+        }
+
+        Time silenceDuration = now - gttEntry.lastSeen;
+        if (silenceDuration > livenessTimeout)
+        {
+            NS_LOG_DEBUG("CheckNeighborLiveness: " << nb.m_neighborAddress
+                         << " silent for " << silenceDuration.As(Time::S)
+                         << " (threshold " << livenessTimeout.As(Time::S)
+                         << "). Marking departed.");
+            if (m_gtt.MarkDeparted(nb.m_neighborAddress))
+            {
+                SendTcUpdate(nb.m_neighborAddress, TcUpdateHeader::NODE_LEAVE);
+            }
+            m_verificationState.erase(nb.m_neighborAddress);
+        }
+    }
 }
 
 // ============================================================================
-// RecalcDerivedTimers — update all timers derived from current m_gttTtl
+// RecalcDerivedTimers — update timers derived from current m_gttTtl
 // ============================================================================
 
 void
@@ -3648,14 +3848,12 @@ RoutingProtocol::RecalcDerivedTimers()
     // Sync GTT's default TTL (used for new entries and entries at table default)
     m_gtt.SetDefaultTtl(m_gttTtl);
 
-    // HelloInterval = 0.5 * GttTtl
-    if (m_enablePeriodicHello)
-    {
-        m_helloInterval = Seconds(m_gttTtl.GetSeconds() * 0.5);
-    }
+    // HELLO interval is managed independently by EMA-based adaptive logic.
+    // It is NOT derived from GttTtl.
 
-    // ActiveRouteTimeout = 2 * GttTtl (routes outlive GTT entries)
-    m_activeRouteTimeout = Seconds(m_gttTtl.GetSeconds() * 2.0);
+    // ActiveRouteTimeout = 1.2 * GttTtl (routes outlive GTT entries with margin
+    // for network fluctuations, but expire sooner to avoid stale-route buildup)
+    m_activeRouteTimeout = Seconds(m_gttTtl.GetSeconds() * 1.2);
 
     // MyRouteTimeout depends on ActiveRouteTimeout
     m_myRouteTimeout = Time(2 * std::max(m_pathDiscoveryTime, m_activeRouteTimeout));
@@ -3708,6 +3906,39 @@ RoutingProtocol::RouteRequestTimerExpire(Ipv4Address dst)
 
     if (toDst.GetFlag() == IN_SEARCH)
     {
+        // ERS capping for verification: if the node's GTT was refreshed
+        // (confirmed alive via freshness response) during ERS, allow one
+        // more expansion step, then stop.  The node IS reachable — one more
+        // ring should find a path.
+        auto vit = m_verificationState.find(dst);
+        if (vit != m_verificationState.end())
+        {
+            GttEntry gttDst;
+            bool gttFresh = m_gtt.LookupEntry(dst, gttDst) && !gttDst.departed &&
+                            Simulator::Now() < gttDst.ttlExpiry;
+
+            if (gttFresh)
+            {
+                if (!vit->second.ersCapped)
+                {
+                    // First time noticing GTT refresh during ERS — allow one more try
+                    vit->second.ersCapped = true;
+                    NS_LOG_DEBUG("ERS capped for " << dst
+                                 << " — GTT refreshed, allowing one more expansion");
+                }
+                else
+                {
+                    // Already had the extra try — stop ERS
+                    NS_LOG_DEBUG("ERS capped: stopping search for " << dst
+                                 << " (node alive, route not found after capped retry)");
+                    m_addressReqTimer.erase(dst);
+                    // Don't drop packets — node confirmed alive, route will be
+                    // found on demand when the next data packet triggers RREQ.
+                    return;
+                }
+            }
+        }
+
         NS_LOG_LOGIC("Resend RREQ to " << dst << " previous ttl " << toDst.GetHop());
         SendRequest(dst);
     }

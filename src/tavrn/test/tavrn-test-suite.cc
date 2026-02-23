@@ -27,6 +27,18 @@ namespace ns3
 namespace tavrn
 {
 
+/// Initialize compressed encoding for all header tests.
+/// Must be called before any header serialize/deserialize.
+static void
+EnsureCompressedEncodingInit()
+{
+    if (!CompressedEncoding::IsInitialized())
+    {
+        // Use 10.1.1.0/24 as the test network prefix
+        CompressedEncoding::SetNetworkPrefix(Ipv4Address("10.1.1.1"));
+    }
+}
+
 // ============================================================================
 // 1. TypeHeaderTest
 // ============================================================================
@@ -95,21 +107,23 @@ struct ERreqHeaderTest : public TestCase
 
     void DoRun() override
     {
+        EnsureCompressedEncodingInit();
+
         ERreqHeader h(/*flags*/ 0,
                       /*hopCount*/ 6,
                       /*requestID*/ 1,
-                      /*dst*/ Ipv4Address("1.2.3.4"),
+                      /*dst*/ Ipv4Address("10.1.1.4"),
                       /*dstSeqNo*/ 40,
-                      /*origin*/ Ipv4Address("4.3.2.1"),
+                      /*origin*/ Ipv4Address("10.1.1.1"),
                       /*originSeqNo*/ 10);
         NS_TEST_EXPECT_MSG_EQ(h.GetGratuitousRrep(), false, "trivial");
         NS_TEST_EXPECT_MSG_EQ(h.GetDestinationOnly(), false, "trivial");
         NS_TEST_EXPECT_MSG_EQ(h.GetUnknownSeqno(), false, "trivial");
         NS_TEST_EXPECT_MSG_EQ(h.GetHopCount(), 6, "trivial");
         NS_TEST_EXPECT_MSG_EQ(h.GetId(), 1, "trivial");
-        NS_TEST_EXPECT_MSG_EQ(h.GetDst(), Ipv4Address("1.2.3.4"), "trivial");
+        NS_TEST_EXPECT_MSG_EQ(h.GetDst(), Ipv4Address("10.1.1.4"), "trivial");
         NS_TEST_EXPECT_MSG_EQ(h.GetDstSeqno(), 40, "trivial");
-        NS_TEST_EXPECT_MSG_EQ(h.GetOrigin(), Ipv4Address("4.3.2.1"), "trivial");
+        NS_TEST_EXPECT_MSG_EQ(h.GetOrigin(), Ipv4Address("10.1.1.1"), "trivial");
         NS_TEST_EXPECT_MSG_EQ(h.GetOriginSeqno(), 10, "trivial");
 
         // Test flag setters
@@ -120,26 +134,26 @@ struct ERreqHeaderTest : public TestCase
         h.SetUnknownSeqno(true);
         NS_TEST_EXPECT_MSG_EQ(h.GetUnknownSeqno(), true, "trivial");
 
-        // Test field setters
-        h.SetDst(Ipv4Address("1.1.1.1"));
-        NS_TEST_EXPECT_MSG_EQ(h.GetDst(), Ipv4Address("1.1.1.1"), "trivial");
+        // Test field setters (use same /24 prefix for compressed round-trip)
+        h.SetDst(Ipv4Address("10.1.1.11"));
+        NS_TEST_EXPECT_MSG_EQ(h.GetDst(), Ipv4Address("10.1.1.11"), "trivial");
         h.SetDstSeqno(5);
         NS_TEST_EXPECT_MSG_EQ(h.GetDstSeqno(), 5, "trivial");
         h.SetHopCount(7);
         NS_TEST_EXPECT_MSG_EQ(h.GetHopCount(), 7, "trivial");
         h.SetId(55);
         NS_TEST_EXPECT_MSG_EQ(h.GetId(), 55, "trivial");
-        h.SetOrigin(Ipv4Address("4.4.4.4"));
-        NS_TEST_EXPECT_MSG_EQ(h.GetOrigin(), Ipv4Address("4.4.4.4"), "trivial");
+        h.SetOrigin(Ipv4Address("10.1.1.44"));
+        NS_TEST_EXPECT_MSG_EQ(h.GetOrigin(), Ipv4Address("10.1.1.44"), "trivial");
         h.SetOriginSeqno(23);
         NS_TEST_EXPECT_MSG_EQ(h.GetOriginSeqno(), 23, "trivial");
 
-        // Round-trip serialization
+        // Round-trip serialization (compressed: 10 bytes)
         Ptr<Packet> p = Create<Packet>();
         p->AddHeader(h);
         ERreqHeader h2;
         uint32_t bytes = p->RemoveHeader(h2);
-        NS_TEST_EXPECT_MSG_EQ(bytes, 23, "E_RREQ is 23 bytes long (AODV wire compat)");
+        NS_TEST_EXPECT_MSG_EQ(bytes, 10, "E_RREQ is 10 bytes (compressed)");
         NS_TEST_EXPECT_MSG_EQ(h, h2, "Round trip serialization works");
         NS_TEST_EXPECT_MSG_EQ(bytes,
                               h.GetSerializedSize(),
@@ -164,24 +178,27 @@ struct ERrepHeaderTest : public TestCase
 
     void DoRun() override
     {
+        EnsureCompressedEncodingInit();
+
         ERrepHeader h(/*hopCount*/ 12,
-                      /*dst*/ Ipv4Address("1.2.3.4"),
+                      /*dst*/ Ipv4Address("10.1.1.4"),
                       /*dstSeqNo*/ 2,
-                      /*origin*/ Ipv4Address("4.3.2.1"),
+                      /*origin*/ Ipv4Address("10.1.1.1"),
                       /*lifetime*/ Seconds(3));
         NS_TEST_EXPECT_MSG_EQ(h.GetHopCount(), 12, "trivial");
-        NS_TEST_EXPECT_MSG_EQ(h.GetDst(), Ipv4Address("1.2.3.4"), "trivial");
+        NS_TEST_EXPECT_MSG_EQ(h.GetDst(), Ipv4Address("10.1.1.4"), "trivial");
         NS_TEST_EXPECT_MSG_EQ(h.GetDstSeqno(), 2, "trivial");
-        NS_TEST_EXPECT_MSG_EQ(h.GetOrigin(), Ipv4Address("4.3.2.1"), "trivial");
+        NS_TEST_EXPECT_MSG_EQ(h.GetOrigin(), Ipv4Address("10.1.1.1"), "trivial");
+        // Lifetime is compressed: 3000ms -> direct encoding -> 3000ms
         NS_TEST_EXPECT_MSG_EQ(h.GetLifeTime(), Seconds(3), "trivial");
 
-        // Test field setters
-        h.SetDst(Ipv4Address("1.1.1.1"));
-        NS_TEST_EXPECT_MSG_EQ(h.GetDst(), Ipv4Address("1.1.1.1"), "trivial");
+        // Test field setters (use same /24 prefix)
+        h.SetDst(Ipv4Address("10.1.1.11"));
+        NS_TEST_EXPECT_MSG_EQ(h.GetDst(), Ipv4Address("10.1.1.11"), "trivial");
         h.SetDstSeqno(123);
         NS_TEST_EXPECT_MSG_EQ(h.GetDstSeqno(), 123, "trivial");
-        h.SetOrigin(Ipv4Address("4.4.4.4"));
-        NS_TEST_EXPECT_MSG_EQ(h.GetOrigin(), Ipv4Address("4.4.4.4"), "trivial");
+        h.SetOrigin(Ipv4Address("10.1.1.44"));
+        NS_TEST_EXPECT_MSG_EQ(h.GetOrigin(), Ipv4Address("10.1.1.44"), "trivial");
         h.SetLifeTime(MilliSeconds(1200));
         NS_TEST_EXPECT_MSG_EQ(h.GetLifeTime(), MilliSeconds(1200), "trivial");
         h.SetHopCount(15);
@@ -193,12 +210,12 @@ struct ERrepHeaderTest : public TestCase
         h.SetAckRequired(false);
         NS_TEST_EXPECT_MSG_EQ(h.GetAckRequired(), false, "trivial");
 
-        // Round-trip serialization
+        // Round-trip serialization (compressed: 8 bytes)
         Ptr<Packet> p = Create<Packet>();
         p->AddHeader(h);
         ERrepHeader h2;
         uint32_t bytes = p->RemoveHeader(h2);
-        NS_TEST_EXPECT_MSG_EQ(bytes, 19, "E_RREP is 19 bytes long (AODV wire compat)");
+        NS_TEST_EXPECT_MSG_EQ(bytes, 8, "E_RREP is 8 bytes (compressed)");
         NS_TEST_EXPECT_MSG_EQ(h, h2, "Round trip serialization works");
         NS_TEST_EXPECT_MSG_EQ(bytes,
                               h.GetSerializedSize(),
@@ -223,14 +240,16 @@ struct ERerrHeaderTest : public TestCase
 
     void DoRun() override
     {
+        EnsureCompressedEncodingInit();
+
         ERerrHeader h;
 
         // Test NoDelete flag
         h.SetNoDelete(true);
         NS_TEST_EXPECT_MSG_EQ(h.GetNoDelete(), true, "trivial");
 
-        // Test AddUnDestination
-        Ipv4Address dst("1.2.3.4");
+        // Test AddUnDestination (use 10.1.1.x addresses for compressed round-trip)
+        Ipv4Address dst("10.1.1.4");
         NS_TEST_EXPECT_MSG_EQ(h.AddUnDestination(dst, 12), true, "trivial");
         NS_TEST_EXPECT_MSG_EQ(h.GetDestCount(), 1, "trivial");
 
@@ -238,7 +257,7 @@ struct ERerrHeaderTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(h.AddUnDestination(dst, 13), true, "trivial");
 
         // Add second destination
-        Ipv4Address dst2("4.3.2.1");
+        Ipv4Address dst2("10.1.1.21");
         NS_TEST_EXPECT_MSG_EQ(h.AddUnDestination(dst2, 12), true, "trivial");
         NS_TEST_EXPECT_MSG_EQ(h.GetDestCount(), 2, "trivial");
 
@@ -247,15 +266,15 @@ struct ERerrHeaderTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(h.RemoveUnDestination(un), true, "trivial");
         NS_TEST_EXPECT_MSG_EQ(h.GetDestCount(), 1, "One entry removed");
 
-        // Verify variable-length serialization: 3 + 8*N bytes
+        // Verify variable-length serialization: 1 + 3*N bytes (compressed)
         ERerrHeader h3;
-        NS_TEST_EXPECT_MSG_EQ(h3.GetSerializedSize(), 3, "Empty RERR is 3 bytes");
-        h3.AddUnDestination(Ipv4Address("10.0.0.1"), 1);
-        NS_TEST_EXPECT_MSG_EQ(h3.GetSerializedSize(), 11, "RERR with 1 dest is 3 + 8 = 11 bytes");
-        h3.AddUnDestination(Ipv4Address("10.0.0.2"), 2);
+        NS_TEST_EXPECT_MSG_EQ(h3.GetSerializedSize(), 1, "Empty RERR is 1 byte (compressed)");
+        h3.AddUnDestination(Ipv4Address("10.1.1.1"), 1);
+        NS_TEST_EXPECT_MSG_EQ(h3.GetSerializedSize(), 4, "RERR with 1 dest is 1 + 3 = 4 bytes");
+        h3.AddUnDestination(Ipv4Address("10.1.1.2"), 2);
         NS_TEST_EXPECT_MSG_EQ(h3.GetSerializedSize(),
-                              19,
-                              "RERR with 2 dests is 3 + 16 = 19 bytes");
+                              7,
+                              "RERR with 2 dests is 1 + 6 = 7 bytes");
 
         // Round-trip serialization
         Ptr<Packet> p = Create<Packet>();
@@ -284,29 +303,31 @@ struct HelloHeaderTest : public TestCase
 
     void DoRun() override
     {
-        HelloHeader h(Ipv4Address("10.0.0.1"), 42, true);
-        NS_TEST_EXPECT_MSG_EQ(h.GetNodeAddr(), Ipv4Address("10.0.0.1"), "trivial");
+        EnsureCompressedEncodingInit();
+
+        HelloHeader h(Ipv4Address("10.1.1.1"), 42, true);
+        NS_TEST_EXPECT_MSG_EQ(h.GetNodeAddr(), Ipv4Address("10.1.1.1"), "trivial");
         NS_TEST_EXPECT_MSG_EQ(h.GetSeqNo(), 42, "trivial");
         NS_TEST_EXPECT_MSG_EQ(h.GetIsNew(), true, "trivial");
 
-        // Test setters
-        h.SetNodeAddr(Ipv4Address("10.0.0.2"));
-        NS_TEST_EXPECT_MSG_EQ(h.GetNodeAddr(), Ipv4Address("10.0.0.2"), "trivial");
+        // Test setters (use 10.1.1.x addresses for compressed round-trip)
+        h.SetNodeAddr(Ipv4Address("10.1.1.2"));
+        NS_TEST_EXPECT_MSG_EQ(h.GetNodeAddr(), Ipv4Address("10.1.1.2"), "trivial");
         h.SetSeqNo(100);
         NS_TEST_EXPECT_MSG_EQ(h.GetSeqNo(), 100, "trivial");
         h.SetIsNew(false);
         NS_TEST_EXPECT_MSG_EQ(h.GetIsNew(), false, "trivial");
 
-        // Verify serialized size: 4B nodeAddr + 4B seqNo + 1B flags = 9
-        NS_TEST_EXPECT_MSG_EQ(h.GetSerializedSize(), 9, "HELLO is 9 bytes");
+        // Verify serialized size: compressed 1B nodeId + 2B seqNo + 1B flags = 4
+        NS_TEST_EXPECT_MSG_EQ(h.GetSerializedSize(), 4, "HELLO is 4 bytes (compressed)");
 
         // Round-trip serialization
         Ptr<Packet> p = Create<Packet>();
         p->AddHeader(h);
         HelloHeader h2;
         uint32_t bytes = p->RemoveHeader(h2);
-        NS_TEST_EXPECT_MSG_EQ(bytes, 9, "HELLO deserialized to 9 bytes");
-        NS_TEST_EXPECT_MSG_EQ(h2.GetNodeAddr(), Ipv4Address("10.0.0.2"), "trivial");
+        NS_TEST_EXPECT_MSG_EQ(bytes, 4, "HELLO deserialized to 4 bytes");
+        NS_TEST_EXPECT_MSG_EQ(h2.GetNodeAddr(), Ipv4Address("10.1.1.2"), "trivial");
         NS_TEST_EXPECT_MSG_EQ(h2.GetSeqNo(), 100, "trivial");
         NS_TEST_EXPECT_MSG_EQ(h2.GetIsNew(), false, "trivial");
     }
@@ -329,31 +350,34 @@ struct SyncOfferHeaderTest : public TestCase
 
     void DoRun() override
     {
-        SyncOfferHeader h(Ipv4Address("10.0.0.1"), 500, Ipv4Address("10.0.0.99"));
-        NS_TEST_EXPECT_MSG_EQ(h.GetMentorAddr(), Ipv4Address("10.0.0.1"), "trivial");
-        NS_TEST_EXPECT_MSG_EQ(h.GetGttSize(), 500, "trivial");
-        NS_TEST_EXPECT_MSG_EQ(h.GetMenteeAddr(), Ipv4Address("10.0.0.99"), "trivial");
+        EnsureCompressedEncodingInit();
 
-        // Verify serialized size: 4B mentorAddr + 4B gttSize + 4B menteeAddr = 12
-        NS_TEST_EXPECT_MSG_EQ(h.GetSerializedSize(), 12, "SYNC_OFFER is 12 bytes");
+        // gttSize capped at 255 in compressed format
+        SyncOfferHeader h(Ipv4Address("10.1.1.1"), 200, Ipv4Address("10.1.1.99"));
+        NS_TEST_EXPECT_MSG_EQ(h.GetMentorAddr(), Ipv4Address("10.1.1.1"), "trivial");
+        NS_TEST_EXPECT_MSG_EQ(h.GetGttSize(), 200, "trivial");
+        NS_TEST_EXPECT_MSG_EQ(h.GetMenteeAddr(), Ipv4Address("10.1.1.99"), "trivial");
 
-        // Test setters
-        h.SetMentorAddr(Ipv4Address("10.0.0.2"));
-        NS_TEST_EXPECT_MSG_EQ(h.GetMentorAddr(), Ipv4Address("10.0.0.2"), "trivial");
-        h.SetGttSize(1000);
-        NS_TEST_EXPECT_MSG_EQ(h.GetGttSize(), 1000, "trivial");
-        h.SetMenteeAddr(Ipv4Address("10.0.0.50"));
-        NS_TEST_EXPECT_MSG_EQ(h.GetMenteeAddr(), Ipv4Address("10.0.0.50"), "trivial");
+        // Verify serialized size: compressed 1B + 1B + 1B = 3
+        NS_TEST_EXPECT_MSG_EQ(h.GetSerializedSize(), 3, "SYNC_OFFER is 3 bytes (compressed)");
+
+        // Test setters (use 10.1.1.x addresses)
+        h.SetMentorAddr(Ipv4Address("10.1.1.2"));
+        NS_TEST_EXPECT_MSG_EQ(h.GetMentorAddr(), Ipv4Address("10.1.1.2"), "trivial");
+        h.SetGttSize(100);
+        NS_TEST_EXPECT_MSG_EQ(h.GetGttSize(), 100, "trivial");
+        h.SetMenteeAddr(Ipv4Address("10.1.1.50"));
+        NS_TEST_EXPECT_MSG_EQ(h.GetMenteeAddr(), Ipv4Address("10.1.1.50"), "trivial");
 
         // Round-trip serialization
         Ptr<Packet> p = Create<Packet>();
         p->AddHeader(h);
         SyncOfferHeader h2;
         uint32_t bytes = p->RemoveHeader(h2);
-        NS_TEST_EXPECT_MSG_EQ(bytes, 12, "SYNC_OFFER deserialized to 12 bytes");
-        NS_TEST_EXPECT_MSG_EQ(h2.GetMentorAddr(), Ipv4Address("10.0.0.2"), "trivial");
-        NS_TEST_EXPECT_MSG_EQ(h2.GetGttSize(), 1000, "trivial");
-        NS_TEST_EXPECT_MSG_EQ(h2.GetMenteeAddr(), Ipv4Address("10.0.0.50"), "trivial");
+        NS_TEST_EXPECT_MSG_EQ(bytes, 3, "SYNC_OFFER deserialized to 3 bytes");
+        NS_TEST_EXPECT_MSG_EQ(h2.GetMentorAddr(), Ipv4Address("10.1.1.2"), "trivial");
+        NS_TEST_EXPECT_MSG_EQ(h2.GetGttSize(), 100, "trivial");
+        NS_TEST_EXPECT_MSG_EQ(h2.GetMenteeAddr(), Ipv4Address("10.1.1.50"), "trivial");
     }
 };
 
@@ -374,12 +398,14 @@ struct SyncPullHeaderTest : public TestCase
 
     void DoRun() override
     {
+        EnsureCompressedEncodingInit();
+
         SyncPullHeader h(15, 20);
         NS_TEST_EXPECT_MSG_EQ(h.GetIndex(), 15, "trivial");
         NS_TEST_EXPECT_MSG_EQ(h.GetCount(), 20, "trivial");
 
-        // Verify serialized size: 4B index + 4B count = 8
-        NS_TEST_EXPECT_MSG_EQ(h.GetSerializedSize(), 8, "SYNC_PULL is 8 bytes");
+        // Verify serialized size: compressed 1B index + 1B count = 2
+        NS_TEST_EXPECT_MSG_EQ(h.GetSerializedSize(), 2, "SYNC_PULL is 2 bytes (compressed)");
 
         // Test setters
         h.SetIndex(30);
@@ -392,7 +418,7 @@ struct SyncPullHeaderTest : public TestCase
         p->AddHeader(h);
         SyncPullHeader h2;
         uint32_t bytes = p->RemoveHeader(h2);
-        NS_TEST_EXPECT_MSG_EQ(bytes, 8, "SYNC_PULL deserialized to 8 bytes");
+        NS_TEST_EXPECT_MSG_EQ(bytes, 2, "SYNC_PULL deserialized to 2 bytes");
         NS_TEST_EXPECT_MSG_EQ(h2.GetIndex(), 30, "trivial");
         NS_TEST_EXPECT_MSG_EQ(h2.GetCount(), 10, "trivial");
     }
@@ -415,6 +441,8 @@ struct SyncDataHeaderTest : public TestCase
 
     void DoRun() override
     {
+        EnsureCompressedEncodingInit();
+
         SyncDataHeader h;
         h.SetStartIndex(5);
         h.SetTotalEntries(100);
@@ -422,44 +450,44 @@ struct SyncDataHeaderTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(h.GetTotalEntries(), 100, "trivial");
         NS_TEST_EXPECT_MSG_EQ(h.GetEntryCount(), 0, "trivial");
 
-        // Empty header: 4B startIndex + 4B totalEntries + 1B count = 9
-        NS_TEST_EXPECT_MSG_EQ(h.GetSerializedSize(), 9, "Empty SYNC_DATA is 9 bytes");
+        // Empty header: compressed 1B + 1B + 1B = 3
+        NS_TEST_EXPECT_MSG_EQ(h.GetSerializedSize(), 3, "Empty SYNC_DATA is 3 bytes (compressed)");
 
-        // Add entries (now includes seqNo and hopCount)
+        // Add entries (use 10.1.1.x addresses, TTLs must be multiples of 20 for lossless bucket round-trip)
         SyncDataEntry e1;
-        e1.nodeAddr = Ipv4Address("10.0.0.1");
+        e1.nodeAddr = Ipv4Address("10.1.1.1");
         e1.lastSeen = 50;
-        e1.ttlRemaining = 100;
+        e1.ttlRemaining = 100;  // bucket = 5, decode = 100 (lossless)
         e1.seqNo = 10;
         e1.hopCount = 2;
         h.AddEntry(e1);
 
         SyncDataEntry e2;
-        e2.nodeAddr = Ipv4Address("10.0.0.2");
+        e2.nodeAddr = Ipv4Address("10.1.1.2");
         e2.lastSeen = 60;
-        e2.ttlRemaining = 90;
+        e2.ttlRemaining = 80;   // bucket = 4, decode = 80 (lossless)
         e2.seqNo = 20;
         e2.hopCount = 3;
         h.AddEntry(e2);
 
         SyncDataEntry e3;
-        e3.nodeAddr = Ipv4Address("10.0.0.3");
+        e3.nodeAddr = Ipv4Address("10.1.1.3");
         e3.lastSeen = 70;
-        e3.ttlRemaining = 80;
+        e3.ttlRemaining = 60;   // bucket = 3, decode = 60 (lossless)
         e3.seqNo = 30;
         e3.hopCount = 1;
         h.AddEntry(e3);
 
         NS_TEST_EXPECT_MSG_EQ(h.GetEntryCount(), 3, "trivial");
-        // 9 + 3 * 15 = 54 bytes (5 extra bytes per entry for seqNo + hopCount)
-        NS_TEST_EXPECT_MSG_EQ(h.GetSerializedSize(), 54, "SYNC_DATA with 3 entries is 54 bytes");
+        // Compressed: 3 + 3 * 7 = 24 bytes
+        NS_TEST_EXPECT_MSG_EQ(h.GetSerializedSize(), 24, "SYNC_DATA with 3 entries is 24 bytes (compressed)");
 
-        // Verify entries
+        // Verify entries before serialization
         const auto& entries = h.GetEntries();
         NS_TEST_EXPECT_MSG_EQ(entries.size(), 3, "trivial");
-        NS_TEST_EXPECT_MSG_EQ(entries[0].nodeAddr, Ipv4Address("10.0.0.1"), "trivial");
+        NS_TEST_EXPECT_MSG_EQ(entries[0].nodeAddr, Ipv4Address("10.1.1.1"), "trivial");
         NS_TEST_EXPECT_MSG_EQ(entries[1].lastSeen, 60, "trivial");
-        NS_TEST_EXPECT_MSG_EQ(entries[2].ttlRemaining, 80, "trivial");
+        NS_TEST_EXPECT_MSG_EQ(entries[2].ttlRemaining, 60, "trivial");
 
         // Round-trip serialization
         Ptr<Packet> p = Create<Packet>();
@@ -472,16 +500,17 @@ struct SyncDataHeaderTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(h2.GetEntryCount(), 3, "trivial");
 
         const auto& entries2 = h2.GetEntries();
-        NS_TEST_EXPECT_MSG_EQ(entries2[0].nodeAddr, Ipv4Address("10.0.0.1"), "trivial");
-        NS_TEST_EXPECT_MSG_EQ(entries2[1].nodeAddr, Ipv4Address("10.0.0.2"), "trivial");
-        NS_TEST_EXPECT_MSG_EQ(entries2[2].nodeAddr, Ipv4Address("10.0.0.3"), "trivial");
+        NS_TEST_EXPECT_MSG_EQ(entries2[0].nodeAddr, Ipv4Address("10.1.1.1"), "trivial");
+        NS_TEST_EXPECT_MSG_EQ(entries2[1].nodeAddr, Ipv4Address("10.1.1.2"), "trivial");
+        NS_TEST_EXPECT_MSG_EQ(entries2[2].nodeAddr, Ipv4Address("10.1.1.3"), "trivial");
         NS_TEST_EXPECT_MSG_EQ(entries2[0].lastSeen, 50, "trivial");
         NS_TEST_EXPECT_MSG_EQ(entries2[1].lastSeen, 60, "trivial");
         NS_TEST_EXPECT_MSG_EQ(entries2[2].lastSeen, 70, "trivial");
-        NS_TEST_EXPECT_MSG_EQ(entries2[0].ttlRemaining, 100, "trivial");
-        NS_TEST_EXPECT_MSG_EQ(entries2[1].ttlRemaining, 90, "trivial");
-        NS_TEST_EXPECT_MSG_EQ(entries2[2].ttlRemaining, 80, "trivial");
-        // Verify seqNo and hopCount round-trip
+        // TTL uses bucket encoding: exact multiples of 20 survive losslessly
+        NS_TEST_EXPECT_MSG_EQ(entries2[0].ttlRemaining, 100, "TTL bucket round-trip");
+        NS_TEST_EXPECT_MSG_EQ(entries2[1].ttlRemaining, 80, "TTL bucket round-trip");
+        NS_TEST_EXPECT_MSG_EQ(entries2[2].ttlRemaining, 60, "TTL bucket round-trip");
+        // Verify seqNo and hopCount round-trip (seqNo truncated to 16 bits)
         NS_TEST_EXPECT_MSG_EQ(entries2[0].seqNo, 10, "seqNo round-trip");
         NS_TEST_EXPECT_MSG_EQ(entries2[1].seqNo, 20, "seqNo round-trip");
         NS_TEST_EXPECT_MSG_EQ(entries2[2].seqNo, 30, "seqNo round-trip");
@@ -508,45 +537,48 @@ struct TcUpdateHeaderTest : public TestCase
 
     void DoRun() override
     {
-        TcUpdateHeader h(Ipv4Address("10.0.0.1"),
+        EnsureCompressedEncodingInit();
+
+        // Use 10.1.1.x addresses and timestamp < 65535 for compressed round-trip
+        TcUpdateHeader h(Ipv4Address("10.1.1.1"),
                          42,
-                         Ipv4Address("10.0.0.5"),
+                         Ipv4Address("10.1.1.5"),
                          TcUpdateHeader::NODE_JOIN,
                          12345);
-        NS_TEST_EXPECT_MSG_EQ(h.GetOriginAddr(), Ipv4Address("10.0.0.1"), "trivial");
+        NS_TEST_EXPECT_MSG_EQ(h.GetOriginAddr(), Ipv4Address("10.1.1.1"), "trivial");
         NS_TEST_EXPECT_MSG_EQ(h.GetSeqNo(), 42, "trivial");
-        NS_TEST_EXPECT_MSG_EQ(h.GetSubjectAddr(), Ipv4Address("10.0.0.5"), "trivial");
+        NS_TEST_EXPECT_MSG_EQ(h.GetSubjectAddr(), Ipv4Address("10.1.1.5"), "trivial");
         NS_TEST_EXPECT_MSG_EQ(h.GetEventType(), TcUpdateHeader::NODE_JOIN, "trivial");
         NS_TEST_EXPECT_MSG_EQ(h.GetTimestamp(), 12345, "trivial");
 
         // Test UUID: (originAddr << 32) | seqNo
         uint64_t expectedUuid =
-            (static_cast<uint64_t>(Ipv4Address("10.0.0.1").Get()) << 32) | 42;
+            (static_cast<uint64_t>(Ipv4Address("10.1.1.1").Get()) << 32) | 42;
         NS_TEST_EXPECT_MSG_EQ(h.GetUuid(), expectedUuid, "UUID computed correctly");
 
         // Test NODE_LEAVE event type
         h.SetEventType(TcUpdateHeader::NODE_LEAVE);
         NS_TEST_EXPECT_MSG_EQ(h.GetEventType(), TcUpdateHeader::NODE_LEAVE, "trivial");
 
-        // Test setters
-        h.SetOriginAddr(Ipv4Address("10.0.0.2"));
-        NS_TEST_EXPECT_MSG_EQ(h.GetOriginAddr(), Ipv4Address("10.0.0.2"), "trivial");
+        // Test setters (use 10.1.1.x addresses, timestamp fits in 16 bits)
+        h.SetOriginAddr(Ipv4Address("10.1.1.2"));
+        NS_TEST_EXPECT_MSG_EQ(h.GetOriginAddr(), Ipv4Address("10.1.1.2"), "trivial");
         h.SetSeqNo(99);
         NS_TEST_EXPECT_MSG_EQ(h.GetSeqNo(), 99, "trivial");
-        h.SetSubjectAddr(Ipv4Address("10.0.0.10"));
-        NS_TEST_EXPECT_MSG_EQ(h.GetSubjectAddr(), Ipv4Address("10.0.0.10"), "trivial");
-        h.SetTimestamp(99999);
-        NS_TEST_EXPECT_MSG_EQ(h.GetTimestamp(), 99999, "trivial");
+        h.SetSubjectAddr(Ipv4Address("10.1.1.10"));
+        NS_TEST_EXPECT_MSG_EQ(h.GetSubjectAddr(), Ipv4Address("10.1.1.10"), "trivial");
+        h.SetTimestamp(60000);
+        NS_TEST_EXPECT_MSG_EQ(h.GetTimestamp(), 60000, "trivial");
 
-        // Verify serialized size: 4+4+4+1+4 = 17 bytes
-        NS_TEST_EXPECT_MSG_EQ(h.GetSerializedSize(), 17, "TC_UPDATE is 17 bytes");
+        // Verify serialized size: compressed 1+2+1+1+2 = 7 bytes
+        NS_TEST_EXPECT_MSG_EQ(h.GetSerializedSize(), 7, "TC_UPDATE is 7 bytes (compressed)");
 
         // Round-trip serialization
         Ptr<Packet> p = Create<Packet>();
         p->AddHeader(h);
         TcUpdateHeader h2;
         uint32_t bytes = p->RemoveHeader(h2);
-        NS_TEST_EXPECT_MSG_EQ(bytes, 17, "TC_UPDATE deserialized to 17 bytes");
+        NS_TEST_EXPECT_MSG_EQ(bytes, 7, "TC_UPDATE deserialized to 7 bytes");
         NS_TEST_EXPECT_MSG_EQ(h, h2, "Round trip serialization works");
     }
 };
@@ -598,6 +630,8 @@ struct TopologyMetadataHeaderTest : public TestCase
 
     void DoRun() override
     {
+        EnsureCompressedEncodingInit();
+
         // Test empty header
         TopologyMetadataHeader h;
         NS_TEST_EXPECT_MSG_EQ(h.GetEntryCount(), 0, "Empty header has 0 entries");
@@ -613,38 +647,38 @@ struct TopologyMetadataHeaderTest : public TestCase
             NS_TEST_EXPECT_MSG_EQ(h2.GetEntryCount(), 0, "Empty after round trip");
         }
 
-        // Test with 1 entry
+        // Test with 1 entry (use 10.1.1.x addresses, TTL multiples of 20 for lossless bucket)
         GttMetadataEntry e1;
-        e1.nodeAddr = Ipv4Address("10.0.0.1");
-        e1.ttlRemaining = 60;
+        e1.nodeAddr = Ipv4Address("10.1.1.1");
+        e1.ttlRemaining = 60;   // bucket=3, decode=60
         e1.flags = 0;
         h.AddEntry(e1);
         NS_TEST_EXPECT_MSG_EQ(h.GetEntryCount(), 1, "1 entry");
-        // 1B count + 1 * 7B = 8
-        NS_TEST_EXPECT_MSG_EQ(h.GetSerializedSize(), 8, "1 entry = 8 bytes");
+        // Compressed: 1B count + 1 * 2B = 3
+        NS_TEST_EXPECT_MSG_EQ(h.GetSerializedSize(), 3, "1 entry = 3 bytes (compressed)");
 
         // Test FLAG_FRESHNESS_REQUEST flag
         GttMetadataEntry e2;
-        e2.nodeAddr = Ipv4Address("10.0.0.2");
-        e2.ttlRemaining = 30;
+        e2.nodeAddr = Ipv4Address("10.1.1.2");
+        e2.ttlRemaining = 40;   // bucket=2, decode=40
         e2.flags = GttMetadataEntry::FLAG_FRESHNESS_REQUEST;
         h.AddEntry(e2);
         NS_TEST_EXPECT_MSG_EQ(h.GetEntryCount(), 2, "2 entries");
 
-        // Add more entries to get to 5
+        // Add more entries to get to 5 (TTL multiples of 20)
         for (int i = 3; i <= 5; ++i)
         {
             GttMetadataEntry e;
             std::ostringstream oss;
-            oss << "10.0.0." << i;
+            oss << "10.1.1." << i;
             e.nodeAddr = Ipv4Address(oss.str().c_str());
-            e.ttlRemaining = static_cast<uint16_t>(100 - i * 10);
+            e.ttlRemaining = static_cast<uint16_t>(i * 20);  // 60, 80, 100
             e.flags = 0;
             h.AddEntry(e);
         }
         NS_TEST_EXPECT_MSG_EQ(h.GetEntryCount(), 5, "5 entries");
-        // 1B count + 5 * 7B = 36
-        NS_TEST_EXPECT_MSG_EQ(h.GetSerializedSize(), 36, "5 entries = 36 bytes");
+        // Compressed: 1B count + 5 * 2B = 11
+        NS_TEST_EXPECT_MSG_EQ(h.GetSerializedSize(), 11, "5 entries = 11 bytes (compressed)");
 
         // Round-trip with 5 entries
         {
@@ -652,15 +686,15 @@ struct TopologyMetadataHeaderTest : public TestCase
             p->AddHeader(h);
             TopologyMetadataHeader h2;
             uint32_t bytes = p->RemoveHeader(h2);
-            NS_TEST_EXPECT_MSG_EQ(bytes, 36, "5-entry metadata deserialized to 36 bytes");
+            NS_TEST_EXPECT_MSG_EQ(bytes, 11, "5-entry metadata deserialized to 11 bytes");
             NS_TEST_EXPECT_MSG_EQ(h2.GetEntryCount(), 5, "5 entries after round trip");
 
             const auto& entries = h2.GetEntries();
-            NS_TEST_EXPECT_MSG_EQ(entries[0].nodeAddr, Ipv4Address("10.0.0.1"), "trivial");
-            NS_TEST_EXPECT_MSG_EQ(entries[0].ttlRemaining, 60, "trivial");
+            NS_TEST_EXPECT_MSG_EQ(entries[0].nodeAddr, Ipv4Address("10.1.1.1"), "trivial");
+            NS_TEST_EXPECT_MSG_EQ(entries[0].ttlRemaining, 60, "TTL bucket round-trip");
             NS_TEST_EXPECT_MSG_EQ(entries[0].flags, 0, "trivial");
-            NS_TEST_EXPECT_MSG_EQ(entries[1].nodeAddr, Ipv4Address("10.0.0.2"), "trivial");
-            NS_TEST_EXPECT_MSG_EQ(entries[1].ttlRemaining, 30, "trivial");
+            NS_TEST_EXPECT_MSG_EQ(entries[1].nodeAddr, Ipv4Address("10.1.1.2"), "trivial");
+            NS_TEST_EXPECT_MSG_EQ(entries[1].ttlRemaining, 40, "TTL bucket round-trip");
             NS_TEST_EXPECT_MSG_EQ(entries[1].flags,
                                   GttMetadataEntry::FLAG_FRESHNESS_REQUEST,
                                   "Freshness flag preserved");

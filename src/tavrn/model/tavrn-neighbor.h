@@ -174,6 +174,15 @@ class Neighbors
      * @returns the IP address, or Ipv4Address() if not found
      */
     Ipv4Address LookupIpAddress(Mac48Address mac) const;
+
+    /**
+     * Get read-only access to the neighbor list for iteration.
+     * @returns const reference to the internal neighbor vector
+     */
+    const std::vector<Neighbor>& GetNeighborList() const
+    {
+        return m_nb;
+    }
     //\}
 
   private:

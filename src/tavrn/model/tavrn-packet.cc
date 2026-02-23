@@ -17,6 +17,109 @@ namespace tavrn
 NS_LOG_COMPONENT_DEFINE("TavrnPacket");
 
 // ============================================================================
+// CompressedEncoding — static members and helpers
+// ============================================================================
+
+uint32_t CompressedEncoding::s_networkPrefix = 0;
+bool CompressedEncoding::s_initialized = false;
+
+void
+CompressedEncoding::SetNetworkPrefix(Ipv4Address prefix)
+{
+    // Store prefix with last octet zeroed: e.g., 10.1.1.0/24 -> 0x0A010100
+    s_networkPrefix = prefix.Get() & 0xFFFFFF00;
+    s_initialized = true;
+    NS_LOG_INFO("CompressedEncoding: network prefix set to "
+                << Ipv4Address(s_networkPrefix) << " (0x" << std::hex << s_networkPrefix
+                << std::dec << ")");
+}
+
+Ipv4Address
+CompressedEncoding::GetNetworkPrefix()
+{
+    return Ipv4Address(s_networkPrefix);
+}
+
+bool
+CompressedEncoding::IsInitialized()
+{
+    return s_initialized;
+}
+
+uint8_t
+CompressedEncoding::IpToNodeId(Ipv4Address addr)
+{
+    return static_cast<uint8_t>(addr.Get() & 0xFF);
+}
+
+Ipv4Address
+CompressedEncoding::NodeIdToIp(uint8_t id)
+{
+    NS_ASSERT_MSG(s_initialized, "CompressedEncoding: network prefix not set");
+    return Ipv4Address(s_networkPrefix | id);
+}
+
+uint8_t
+CompressedEncoding::EncodeTtlBucket(uint16_t ttlSeconds)
+{
+    if (ttlSeconds == 0)
+    {
+        return 0;
+    }
+    // Round up: any nonzero TTL encodes as at least bucket 1 (20s).
+    // Prevents living entries from appearing expired (bucket 0 = 0s)
+    // and triggering unnecessary freshness responses.
+    return static_cast<uint8_t>(std::min(15u, (static_cast<unsigned>(ttlSeconds) + 19) / 20));
+}
+
+uint16_t
+CompressedEncoding::DecodeTtlBucket(uint8_t bucket)
+{
+    return static_cast<uint16_t>(bucket) * 20;
+}
+
+uint16_t
+CompressedEncoding::CompressSeqNo(uint32_t seqNo)
+{
+    return static_cast<uint16_t>(seqNo & 0xFFFF);
+}
+
+uint32_t
+CompressedEncoding::ExpandSeqNo(uint16_t compressed)
+{
+    return static_cast<uint32_t>(compressed);
+}
+
+uint16_t
+CompressedEncoding::EncodeLifetime(uint32_t lifetimeMs)
+{
+    if (lifetimeMs <= 16383)
+    {
+        // Direct encoding: bit 15 = 0, bits 0-14 = ms
+        return static_cast<uint16_t>(lifetimeMs);
+    }
+    // Scaled encoding: bit 15 = 1, bits 0-14 = ms / 100
+    uint32_t scaled = lifetimeMs / 100;
+    if (scaled > 32767)
+    {
+        scaled = 32767; // Max: 3276.7 seconds
+    }
+    return static_cast<uint16_t>(0x8000 | scaled);
+}
+
+uint32_t
+CompressedEncoding::DecodeLifetime(uint16_t encoded)
+{
+    if ((encoded & 0x8000) == 0)
+    {
+        // Direct: bits 0-14 = ms
+        return static_cast<uint32_t>(encoded);
+    }
+    // Scaled: bits 0-14 * 100 = ms
+    return static_cast<uint32_t>(encoded & 0x7FFF) * 100;
+}
+
+// ============================================================================
 // TypeHeader
 // ============================================================================
 
@@ -163,8 +266,8 @@ TopologyMetadataHeader::GetInstanceTypeId() const
 uint32_t
 TopologyMetadataHeader::GetSerializedSize() const
 {
-    // 1B count + N * (4B addr + 2B ttl + 1B flags)
-    return 1 + static_cast<uint32_t>(m_entries.size()) * 7;
+    // Compressed: 1B count + N * (1B nodeId + 1B packed{4-bit TTL bucket | 4-bit flags})
+    return 1 + static_cast<uint32_t>(m_entries.size()) * 2;
 }
 
 void
@@ -173,9 +276,11 @@ TopologyMetadataHeader::Serialize(Buffer::Iterator i) const
     i.WriteU8(static_cast<uint8_t>(m_entries.size()));
     for (const auto& entry : m_entries)
     {
-        WriteTo(i, entry.nodeAddr);
-        i.WriteHtonU16(entry.ttlRemaining);
-        i.WriteU8(entry.flags);
+        i.WriteU8(CompressedEncoding::IpToNodeId(entry.nodeAddr));
+        // Pack: high nibble = TTL bucket (4 bits), low nibble = flags (4 bits)
+        uint8_t ttlBucket = CompressedEncoding::EncodeTtlBucket(entry.ttlRemaining);
+        uint8_t packed = static_cast<uint8_t>((ttlBucket << 4) | (entry.flags & 0x0F));
+        i.WriteU8(packed);
     }
 }
 
@@ -189,9 +294,12 @@ TopologyMetadataHeader::Deserialize(Buffer::Iterator start)
     for (uint8_t k = 0; k < count; ++k)
     {
         GttMetadataEntry entry;
-        ReadFrom(i, entry.nodeAddr);
-        entry.ttlRemaining = i.ReadNtohU16();
-        entry.flags = i.ReadU8();
+        uint8_t nodeId = i.ReadU8();
+        entry.nodeAddr = CompressedEncoding::NodeIdToIp(nodeId);
+        uint8_t packed = i.ReadU8();
+        uint8_t ttlBucket = (packed >> 4) & 0x0F;
+        entry.ttlRemaining = CompressedEncoding::DecodeTtlBucket(ttlBucket);
+        entry.flags = packed & 0x0F;
         m_entries.push_back(entry);
     }
     uint32_t dist = i.GetDistanceFrom(start);
@@ -259,24 +367,21 @@ ERreqHeader::GetInstanceTypeId() const
 uint32_t
 ERreqHeader::GetSerializedSize() const
 {
-    // Match AODV wire format exactly (23 bytes per RFC 3561):
-    // 1B flags + 1B reserved + 1B hopCount +
-    // 4B requestID + 4B dst + 4B dstSeqNo + 4B origin + 4B originSeqNo = 23
-    return 23;
+    // Compressed: 1B flags + 1B hopCount + 2B requestID +
+    // 1B dstNodeId + 2B dstSeqNo + 1B originNodeId + 2B originSeqNo = 10
+    return 10;
 }
 
 void
 ERreqHeader::Serialize(Buffer::Iterator i) const
 {
     i.WriteU8(m_flags);
-    i.WriteU8(0); // reserved
     i.WriteU8(m_hopCount);
-    // removed extra reserved byte to match AODV 23-byte format
-    i.WriteHtonU32(m_requestID);
-    WriteTo(i, m_dst);
-    i.WriteHtonU32(m_dstSeqNo);
-    WriteTo(i, m_origin);
-    i.WriteHtonU32(m_originSeqNo);
+    i.WriteHtonU16(static_cast<uint16_t>(m_requestID & 0xFFFF));
+    i.WriteU8(CompressedEncoding::IpToNodeId(m_dst));
+    i.WriteHtonU16(CompressedEncoding::CompressSeqNo(m_dstSeqNo));
+    i.WriteU8(CompressedEncoding::IpToNodeId(m_origin));
+    i.WriteHtonU16(CompressedEncoding::CompressSeqNo(m_originSeqNo));
 }
 
 uint32_t
@@ -284,14 +389,12 @@ ERreqHeader::Deserialize(Buffer::Iterator start)
 {
     Buffer::Iterator i = start;
     m_flags = i.ReadU8();
-    i.ReadU8(); // reserved
     m_hopCount = i.ReadU8();
-    // removed extra reserved byte to match AODV 23-byte format
-    m_requestID = i.ReadNtohU32();
-    ReadFrom(i, m_dst);
-    m_dstSeqNo = i.ReadNtohU32();
-    ReadFrom(i, m_origin);
-    m_originSeqNo = i.ReadNtohU32();
+    m_requestID = static_cast<uint32_t>(i.ReadNtohU16());
+    m_dst = CompressedEncoding::NodeIdToIp(i.ReadU8());
+    m_dstSeqNo = CompressedEncoding::ExpandSeqNo(i.ReadNtohU16());
+    m_origin = CompressedEncoding::NodeIdToIp(i.ReadU8());
+    m_originSeqNo = CompressedEncoding::ExpandSeqNo(i.ReadNtohU16());
 
     uint32_t dist = i.GetDistanceFrom(start);
     NS_ASSERT(dist == GetSerializedSize());
@@ -422,21 +525,20 @@ ERrepHeader::GetInstanceTypeId() const
 uint32_t
 ERrepHeader::GetSerializedSize() const
 {
-    // Match AODV wire format exactly (19 bytes per RFC 3561):
-    // 1B flags + 1B prefixSize + 1B hopCount + 4B dst + 4B dstSeqNo + 4B origin + 4B lifetime = 19
-    return 19;
+    // Compressed: 1B flags + 1B hopCount + 1B dstNodeId + 2B dstSeqNo +
+    // 1B originNodeId + 2B lifetime = 8
+    return 8;
 }
 
 void
 ERrepHeader::Serialize(Buffer::Iterator i) const
 {
     i.WriteU8(m_flags);
-    i.WriteU8(m_prefixSize);  // prefixSize instead of 2B reserved
     i.WriteU8(m_hopCount);
-    WriteTo(i, m_dst);
-    i.WriteHtonU32(m_dstSeqNo);
-    WriteTo(i, m_origin);
-    i.WriteHtonU32(m_lifeTime);
+    i.WriteU8(CompressedEncoding::IpToNodeId(m_dst));
+    i.WriteHtonU16(CompressedEncoding::CompressSeqNo(m_dstSeqNo));
+    i.WriteU8(CompressedEncoding::IpToNodeId(m_origin));
+    i.WriteHtonU16(CompressedEncoding::EncodeLifetime(m_lifeTime));
 }
 
 uint32_t
@@ -444,12 +546,11 @@ ERrepHeader::Deserialize(Buffer::Iterator start)
 {
     Buffer::Iterator i = start;
     m_flags = i.ReadU8();
-    m_prefixSize = i.ReadU8();
     m_hopCount = i.ReadU8();
-    ReadFrom(i, m_dst);
-    m_dstSeqNo = i.ReadNtohU32();
-    ReadFrom(i, m_origin);
-    m_lifeTime = i.ReadNtohU32();
+    m_dst = CompressedEncoding::NodeIdToIp(i.ReadU8());
+    m_dstSeqNo = CompressedEncoding::ExpandSeqNo(i.ReadNtohU16());
+    m_origin = CompressedEncoding::NodeIdToIp(i.ReadU8());
+    m_lifeTime = CompressedEncoding::DecodeLifetime(i.ReadNtohU16());
 
     uint32_t dist = i.GetDistanceFrom(start);
     NS_ASSERT(dist == GetSerializedSize());
@@ -543,20 +644,33 @@ ERerrHeader::GetInstanceTypeId() const
 uint32_t
 ERerrHeader::GetSerializedSize() const
 {
-    // 1B flag + 1B reserved + 1B destCount + N * (4B addr + 4B seq)
-    return (3 + 8 * GetDestCount());
+    // Compressed: 1B flags (includes count in high 5 bits, noDelete in bit 0)
+    // + N * (1B dstNodeId + 2B seqNo) = 1 + 3N
+    return (1 + 3 * GetDestCount());
 }
 
 void
 ERerrHeader::Serialize(Buffer::Iterator i) const
 {
-    i.WriteU8(m_flag);
-    i.WriteU8(m_reserved);
-    i.WriteU8(GetDestCount());
-    for (auto j = m_unreachableDstSeqNo.begin(); j != m_unreachableDstSeqNo.end(); ++j)
+    // ESC flags byte layout:
+    //   bit 0     = N (noDelete flag)
+    //   bits 1-2  = AM_d (address mode for destinations, fixed AM=11 for ns-3 k=1)
+    //   bit 3     = A (ambiguity flag, reserved for ESC collision handling)
+    //   bits 4-7  = destCount (4 bits, max 15; capped on serialize)
+    uint8_t count = std::min(static_cast<uint8_t>(15), GetDestCount());
+    uint8_t packed = (m_flag & 0x01)   // bit 0: N
+                   | (0x03 << 1)       // bits 1-2: AM=11 (1-byte suffix)
+                   | (0 << 3)          // bit 3: A=0 (no ambiguity)
+                   | (count << 4);     // bits 4-7: destCount
+    i.WriteU8(packed);
+
+    uint8_t written = 0;
+    for (auto j = m_unreachableDstSeqNo.begin();
+         j != m_unreachableDstSeqNo.end() && written < count;
+         ++j, ++written)
     {
-        WriteTo(i, j->first);
-        i.WriteHtonU32(j->second);
+        i.WriteU8(CompressedEncoding::IpToNodeId(j->first));
+        i.WriteHtonU16(CompressedEncoding::CompressSeqNo(j->second));
     }
 }
 
@@ -564,16 +678,18 @@ uint32_t
 ERerrHeader::Deserialize(Buffer::Iterator start)
 {
     Buffer::Iterator i = start;
-    m_flag = i.ReadU8();
-    m_reserved = i.ReadU8();
-    uint8_t dest = i.ReadU8();
+    uint8_t packed = i.ReadU8();
+    m_flag = packed & 0x01;            // bit 0: N
+    m_reserved = 0;
+    // bits 1-2: AM_d (ignored in ns-3, always k=1)
+    // bit 3: A (ambiguity flag, ignored for now)
+    uint8_t dest = (packed >> 4) & 0x0F;  // bits 4-7: destCount (max 15)
     m_unreachableDstSeqNo.clear();
-    Ipv4Address address;
-    uint32_t seqNo;
     for (uint8_t k = 0; k < dest; ++k)
     {
-        ReadFrom(i, address);
-        seqNo = i.ReadNtohU32();
+        uint8_t nodeId = i.ReadU8();
+        Ipv4Address address = CompressedEncoding::NodeIdToIp(nodeId);
+        uint32_t seqNo = CompressedEncoding::ExpandSeqNo(i.ReadNtohU16());
         m_unreachableDstSeqNo.insert(std::make_pair(address, seqNo));
     }
 
@@ -707,15 +823,15 @@ HelloHeader::GetInstanceTypeId() const
 uint32_t
 HelloHeader::GetSerializedSize() const
 {
-    // 4B nodeAddr + 4B seqNo + 1B flags = 9
-    return 9;
+    // Compressed: 1B nodeId + 2B seqNo + 1B flags = 4
+    return 4;
 }
 
 void
 HelloHeader::Serialize(Buffer::Iterator i) const
 {
-    WriteTo(i, m_nodeAddr);
-    i.WriteHtonU32(m_seqNo);
+    i.WriteU8(CompressedEncoding::IpToNodeId(m_nodeAddr));
+    i.WriteHtonU16(CompressedEncoding::CompressSeqNo(m_seqNo));
     uint8_t flags = 0;
     if (m_isNew)
     {
@@ -728,8 +844,8 @@ uint32_t
 HelloHeader::Deserialize(Buffer::Iterator start)
 {
     Buffer::Iterator i = start;
-    ReadFrom(i, m_nodeAddr);
-    m_seqNo = i.ReadNtohU32();
+    m_nodeAddr = CompressedEncoding::NodeIdToIp(i.ReadU8());
+    m_seqNo = CompressedEncoding::ExpandSeqNo(i.ReadNtohU16());
     uint8_t flags = i.ReadU8();
     m_isNew = (flags & (1 << 0));
 
@@ -783,25 +899,25 @@ SyncOfferHeader::GetInstanceTypeId() const
 uint32_t
 SyncOfferHeader::GetSerializedSize() const
 {
-    // 4B mentorAddr + 4B gttSize + 4B menteeAddr = 12
-    return 12;
+    // Compressed: 1B mentorNodeId + 1B gttSize + 1B menteeNodeId = 3
+    return 3;
 }
 
 void
 SyncOfferHeader::Serialize(Buffer::Iterator i) const
 {
-    WriteTo(i, m_mentorAddr);
-    i.WriteHtonU32(m_gttSize);
-    WriteTo(i, m_menteeAddr);
+    i.WriteU8(CompressedEncoding::IpToNodeId(m_mentorAddr));
+    i.WriteU8(static_cast<uint8_t>(std::min(m_gttSize, 255u)));
+    i.WriteU8(CompressedEncoding::IpToNodeId(m_menteeAddr));
 }
 
 uint32_t
 SyncOfferHeader::Deserialize(Buffer::Iterator start)
 {
     Buffer::Iterator i = start;
-    ReadFrom(i, m_mentorAddr);
-    m_gttSize = i.ReadNtohU32();
-    ReadFrom(i, m_menteeAddr);
+    m_mentorAddr = CompressedEncoding::NodeIdToIp(i.ReadU8());
+    m_gttSize = static_cast<uint32_t>(i.ReadU8());
+    m_menteeAddr = CompressedEncoding::NodeIdToIp(i.ReadU8());
 
     uint32_t dist = i.GetDistanceFrom(start);
     NS_ASSERT(dist == GetSerializedSize());
@@ -853,23 +969,23 @@ SyncPullHeader::GetInstanceTypeId() const
 uint32_t
 SyncPullHeader::GetSerializedSize() const
 {
-    // 4B index + 4B count = 8
-    return 8;
+    // Compressed: 1B index + 1B count = 2
+    return 2;
 }
 
 void
 SyncPullHeader::Serialize(Buffer::Iterator i) const
 {
-    i.WriteHtonU32(m_index);
-    i.WriteHtonU32(m_count);
+    i.WriteU8(static_cast<uint8_t>(std::min(m_index, 255u)));
+    i.WriteU8(static_cast<uint8_t>(std::min(m_count, 255u)));
 }
 
 uint32_t
 SyncPullHeader::Deserialize(Buffer::Iterator start)
 {
     Buffer::Iterator i = start;
-    m_index = i.ReadNtohU32();
-    m_count = i.ReadNtohU32();
+    m_index = static_cast<uint32_t>(i.ReadU8());
+    m_count = static_cast<uint32_t>(i.ReadU8());
 
     uint32_t dist = i.GetDistanceFrom(start);
     NS_ASSERT(dist == GetSerializedSize());
@@ -920,23 +1036,23 @@ SyncDataHeader::GetInstanceTypeId() const
 uint32_t
 SyncDataHeader::GetSerializedSize() const
 {
-    // 4B startIndex + 4B totalEntries + 1B count
-    // + N * (4B addr + 4B lastSeen + 2B ttl + 4B seqNo + 1B hopCount) = 15B each
-    return 9 + static_cast<uint32_t>(m_entries.size()) * 15;
+    // Compressed: 1B startIndex + 1B totalEntries + 1B count
+    // + N * (1B nodeId + 2B lastSeen + 1B ttlBucket + 2B seqNo + 1B hopCount) = 7B each
+    return 3 + static_cast<uint32_t>(m_entries.size()) * 7;
 }
 
 void
 SyncDataHeader::Serialize(Buffer::Iterator i) const
 {
-    i.WriteHtonU32(m_startIndex);
-    i.WriteHtonU32(m_totalEntries);
+    i.WriteU8(static_cast<uint8_t>(std::min(m_startIndex, 255u)));
+    i.WriteU8(static_cast<uint8_t>(std::min(m_totalEntries, 255u)));
     i.WriteU8(static_cast<uint8_t>(m_entries.size()));
     for (const auto& entry : m_entries)
     {
-        WriteTo(i, entry.nodeAddr);
-        i.WriteHtonU32(entry.lastSeen);
-        i.WriteHtonU16(entry.ttlRemaining);
-        i.WriteHtonU32(entry.seqNo);
+        i.WriteU8(CompressedEncoding::IpToNodeId(entry.nodeAddr));
+        i.WriteHtonU16(static_cast<uint16_t>(std::min(entry.lastSeen, 65535u)));
+        i.WriteU8(CompressedEncoding::EncodeTtlBucket(entry.ttlRemaining));
+        i.WriteHtonU16(CompressedEncoding::CompressSeqNo(entry.seqNo));
         i.WriteU8(entry.hopCount);
     }
 }
@@ -945,18 +1061,18 @@ uint32_t
 SyncDataHeader::Deserialize(Buffer::Iterator start)
 {
     Buffer::Iterator i = start;
-    m_startIndex = i.ReadNtohU32();
-    m_totalEntries = i.ReadNtohU32();
+    m_startIndex = static_cast<uint32_t>(i.ReadU8());
+    m_totalEntries = static_cast<uint32_t>(i.ReadU8());
     uint8_t count = i.ReadU8();
     m_entries.clear();
     m_entries.reserve(count);
     for (uint8_t k = 0; k < count; ++k)
     {
         SyncDataEntry entry;
-        ReadFrom(i, entry.nodeAddr);
-        entry.lastSeen = i.ReadNtohU32();
-        entry.ttlRemaining = i.ReadNtohU16();
-        entry.seqNo = i.ReadNtohU32();
+        entry.nodeAddr = CompressedEncoding::NodeIdToIp(i.ReadU8());
+        entry.lastSeen = static_cast<uint32_t>(i.ReadNtohU16());
+        entry.ttlRemaining = CompressedEncoding::DecodeTtlBucket(i.ReadU8());
+        entry.seqNo = CompressedEncoding::ExpandSeqNo(i.ReadNtohU16());
         entry.hopCount = i.ReadU8();
         m_entries.push_back(entry);
     }
@@ -1031,29 +1147,29 @@ TcUpdateHeader::GetInstanceTypeId() const
 uint32_t
 TcUpdateHeader::GetSerializedSize() const
 {
-    // 4B originAddr + 4B seqNo + 4B subjectAddr + 1B eventType + 4B timestamp = 17
-    return 17;
+    // Compressed: 1B originNodeId + 2B seqNo + 1B subjectNodeId + 1B eventType + 2B timestamp = 7
+    return 7;
 }
 
 void
 TcUpdateHeader::Serialize(Buffer::Iterator i) const
 {
-    WriteTo(i, m_originAddr);
-    i.WriteHtonU32(m_seqNo);
-    WriteTo(i, m_subjectAddr);
+    i.WriteU8(CompressedEncoding::IpToNodeId(m_originAddr));
+    i.WriteHtonU16(CompressedEncoding::CompressSeqNo(m_seqNo));
+    i.WriteU8(CompressedEncoding::IpToNodeId(m_subjectAddr));
     i.WriteU8(static_cast<uint8_t>(m_eventType));
-    i.WriteHtonU32(m_timestamp);
+    i.WriteHtonU16(static_cast<uint16_t>(std::min(m_timestamp, 65535u)));
 }
 
 uint32_t
 TcUpdateHeader::Deserialize(Buffer::Iterator start)
 {
     Buffer::Iterator i = start;
-    ReadFrom(i, m_originAddr);
-    m_seqNo = i.ReadNtohU32();
-    ReadFrom(i, m_subjectAddr);
+    m_originAddr = CompressedEncoding::NodeIdToIp(i.ReadU8());
+    m_seqNo = CompressedEncoding::ExpandSeqNo(i.ReadNtohU16());
+    m_subjectAddr = CompressedEncoding::NodeIdToIp(i.ReadU8());
     m_eventType = static_cast<EventType>(i.ReadU8());
-    m_timestamp = i.ReadNtohU32();
+    m_timestamp = static_cast<uint32_t>(i.ReadNtohU16());
 
     uint32_t dist = i.GetDistanceFrom(start);
     NS_ASSERT(dist == GetSerializedSize());

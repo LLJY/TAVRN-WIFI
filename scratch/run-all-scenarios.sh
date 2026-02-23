@@ -25,13 +25,15 @@ SIMTIME=600
 MAX_JOBS=24
 BASELINE=""
 JOB_TIMEOUT=3600  # Per-job wall-clock timeout in seconds (default: 1 hour)
+SAMPLE_INTERVAL=0  # Temporal sampling interval (0 = disabled)
 
-# Parse all arguments: positional (nRuns simTime maxJobs) and --baseline=FILE
+# Parse all arguments: positional (nRuns simTime maxJobs) and flags
 POS_ARGS=()
 for arg in "$@"; do
   case "$arg" in
     --baseline=*) BASELINE="${arg#--baseline=}" ;;
     --timeout=*) JOB_TIMEOUT="${arg#--timeout=}" ;;
+    --sampleInterval=*) SAMPLE_INTERVAL="${arg#--sampleInterval=}" ;;
     *) POS_ARGS+=("$arg") ;;
   esac
 done
@@ -52,7 +54,7 @@ if [[ -n "$BASELINE" ]]; then
   PROTOCOLS=(TAVRN)
   echo "Baseline mode: only running TAVRN, merging AODV/OLSR/DSDV from $BASELINE"
 else
-  PROTOCOLS=(TAVRN AODV OLSR DSDV)
+  PROTOCOLS=(TAVRN AODV AODV-Tuned OLSR OLSR-Tuned DSDV)
 fi
 
 mkdir -p "$RESULTS_DIR"
@@ -104,7 +106,7 @@ echo "║  ${TOTAL_JOBS} sim jobs (${TOTAL_SCENARIOS} scenarios × ${#PROTOCOLS[
 if [[ -n "$BASELINE" ]]; then
 echo "║  Baseline: $(basename "$BASELINE")                          ║"
 fi
-echo "║  simTime=${SIMTIME}s  maxParallel=${MAX_JOBS}  timeout=${JOB_TIMEOUT}s            ║"
+echo "║  simTime=${SIMTIME}s  maxParallel=${MAX_JOBS}  timeout=${JOB_TIMEOUT}s  sample=${SAMPLE_INTERVAL}s  ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo ""
 
@@ -145,7 +147,9 @@ for SCENARIO_DEF in "${SCENARIOS[@]}"; do
     # Launch job — releases token when done
     # Uses timeout to kill jobs that exceed JOB_TIMEOUT (e.g. AODV RREQ storms)
     (
-      if OUTPUT=$(timeout --signal=KILL "${JOB_TIMEOUT}" ./ns3 run "tavrn-comparison --protocol=${PROTO} ${ARGS} --simTime=${SIMTIME} --nRuns=${NRUNS}" 2>"$LOGFILE"); then
+      SAMPLE_ARG=""
+      [[ "$SAMPLE_INTERVAL" != "0" ]] && SAMPLE_ARG="--sampleInterval=${SAMPLE_INTERVAL}"
+      if OUTPUT=$(timeout --signal=KILL "${JOB_TIMEOUT}" ./ns3 run "tavrn-comparison --protocol=${PROTO} ${ARGS} --simTime=${SIMTIME} --nRuns=${NRUNS} ${SAMPLE_ARG}" 2>"$LOGFILE"); then
         DATA_LINE=$(echo "$OUTPUT" | tail -1)
         echo "${LABEL},${DATA_LINE}" > "$OUTFILE"
         echo "  [DONE] ${LABEL} / ${PROTO}"
@@ -158,7 +162,7 @@ for SCENARIO_DEF in "${SCENARIOS[@]}"; do
           NNODES=$(echo "${ARGS}" | grep -oP '(?<=--nNodes=)\S+' || echo "0")
           NFLOWS=$(echo "${ARGS}" | grep -oP '(?<=--nFlows=)\S+' || echo "0")
           # DNF row: -1 for all metrics (easily filterable)
-          echo "${LABEL},${PROTO},${SCEN},${NNODES},${NFLOWS},${SIMTIME},${NRUNS},-1,0,-1,0,-1,0,-1,0,-1,0,-1,0,-1,0,-1,0,-1,0,-1,0,-1,0" > "$OUTFILE"
+          echo "${LABEL},${PROTO},${SCEN},${NNODES},${NFLOWS},${SIMTIME},${NRUNS},-1,0,-1,0,-1,0,-1,0,-1,0,-1,0,-1,0,-1,0,-1,0,-1,0,-1,0,-1,0,-1,0,-1,0,-1,0,-1,0" > "$OUTFILE"
           echo "  [DNF]  ${LABEL} / ${PROTO} (killed after ${JOB_TIMEOUT}s — likely packet storm)"
         else
           echo "  [FAIL] ${LABEL} / ${PROTO} (exit ${EXIT_CODE}, see ${LOGFILE})"
@@ -183,7 +187,7 @@ echo ""
 # ─────────────────────────────────────────────────────────────────────────────
 # Collect results in scenario order
 # ─────────────────────────────────────────────────────────────────────────────
-HEADER="scenarioLabel,protocol,scenario,nNodes,nFlows,simTime,nRuns,pdr_mean,pdr_ci95,latency_mean,latency_ci95,steadyBps_mean,steadyBps_ci95,bootstrapBytes_mean,bootstrapBytes_ci95,totalOverhead_mean,totalOverhead_ci95,energy_mean,energy_ci95,txEnergy_mean,txEnergy_ci95,rxEnergy_mean,rxEnergy_ci95,gttAccuracy_mean,gttAccuracy_ci95,convergence_mean,convergence_ci95,routeDiscovery_mean,routeDiscovery_ci95"
+HEADER="scenarioLabel,protocol,scenario,nNodes,nFlows,simTime,nRuns,pdr_mean,pdr_ci95,latency_mean,latency_ci95,steadyTx_mean,steadyTx_ci95,steadyRx_mean,steadyRx_ci95,steadyOverheadBps_mean,steadyOverheadBps_ci95,bootstrapBytes_mean,bootstrapBytes_ci95,totalOverhead_mean,totalOverhead_ci95,energy_mean,energy_ci95,txEnergy_mean,txEnergy_ci95,rxEnergy_mean,rxEnergy_ci95,gttAccuracy_mean,gttAccuracy_ci95,convergence_mean,convergence_ci95,routeDiscovery_mean,routeDiscovery_ci95,twPrecision_mean,twPrecision_ci95,twRecall_mean,twRecall_ci95,avgStaleRatio_mean,avgStaleRatio_ci95,firstDelivery_mean,firstDelivery_ci95"
 echo "$HEADER" > "$CSV_FILE"
 
 # Build a lookup of baseline rows (if provided) keyed on "scenarioLabel,protocol"
@@ -196,7 +200,7 @@ if [[ -n "$BASELINE" ]]; then
   done < <(tail -n +2 "$BASELINE")  # skip header
 fi
 
-ALL_PROTOS=(TAVRN AODV OLSR DSDV)
+ALL_PROTOS=(TAVRN AODV AODV-Tuned OLSR OLSR-Tuned DSDV)
 
 for SCENARIO_DEF in "${SCENARIOS[@]}"; do
   LABEL="${SCENARIO_DEF%%|*}"
@@ -264,12 +268,14 @@ for r in rows:
         scenarios.append(label)
         seen.add(label)
 
-protocols = ["TAVRN", "AODV", "OLSR", "DSDV"]
+protocols = ["TAVRN", "AODV", "AODV-Tuned", "OLSR", "OLSR-Tuned", "DSDV"]
 
 metrics = [
     ("PDR",            "pdr_mean",            "pdr_ci95",            "{:.2f}"),
     ("Latency(ms)",    "latency_mean",        "latency_ci95",        "{:.1f}"),
-    ("Steady(B/s)",    "steadyBps_mean",      "steadyBps_ci95",      "{:.0f}"),
+    ("SteadyTx(B)",    "steadyTx_mean",       "steadyTx_ci95",       "{:.0f}"),
+    ("SteadyRx(B)",    "steadyRx_mean",       "steadyRx_ci95",       "{:.0f}"),
+    ("Overhead(B/s)",  "steadyOverheadBps_mean","steadyOverheadBps_ci95","{:.0f}"),
     ("Bootstrap(B)",   "bootstrapBytes_mean",  "bootstrapBytes_ci95", "{:.0f}"),
     ("TX+RX(J)",       None,                   None,                  "{:.1f}"),
     ("GTT Acc",        "gttAccuracy_mean",     "gttAccuracy_ci95",    "{:.2f}"),
@@ -365,7 +371,7 @@ wins = defaultdict(lambda: defaultdict(int))
 comparable_metrics = [
     ("PDR",          "pdr_mean",       "max"),
     ("Latency",      "latency_mean",   "min"),
-    ("Steady B/s",   "steadyBps_mean", "min"),
+    ("Overhead B/s", "steadyOverheadBps_mean", "min"),
     ("Bootstrap B",  "bootstrapBytes_mean", "min"),
     ("TX+RX Energy", None,             "min"),
 ]
