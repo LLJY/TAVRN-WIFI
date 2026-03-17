@@ -266,14 +266,16 @@ TopologyMetadataHeader::GetInstanceTypeId() const
 uint32_t
 TopologyMetadataHeader::GetSerializedSize() const
 {
-    // Compressed: 1B count + N * (1B nodeId + 1B packed{4-bit TTL bucket | 4-bit flags})
-    return 1 + static_cast<uint32_t>(m_entries.size()) * 2;
+    // Compressed: 1B count + 1B AM+flags + N * (1B nodeId + 1B packed{4-bit TTL bucket | 4-bit flags})
+    return 2 + static_cast<uint32_t>(m_entries.size()) * 2;
 }
 
 void
 TopologyMetadataHeader::Serialize(Buffer::Iterator i) const
 {
     i.WriteU8(static_cast<uint8_t>(m_entries.size()));
+    // AM + flags byte: [3b AM(111) | 5b reserved]
+    i.WriteU8(0xE0); // 111_00000
     for (const auto& entry : m_entries)
     {
         i.WriteU8(CompressedEncoding::IpToNodeId(entry.nodeAddr));
@@ -289,6 +291,7 @@ TopologyMetadataHeader::Deserialize(Buffer::Iterator start)
 {
     Buffer::Iterator i = start;
     uint8_t count = i.ReadU8();
+    i.ReadU8(); // AM + flags byte (skip — fixed AM=111)
     m_entries.clear();
     m_entries.reserve(count);
     for (uint8_t k = 0; k < count; ++k)
@@ -644,25 +647,26 @@ ERerrHeader::GetInstanceTypeId() const
 uint32_t
 ERerrHeader::GetSerializedSize() const
 {
-    // Compressed: 1B flags (includes count in high 5 bits, noDelete in bit 0)
-    // + N * (1B dstNodeId + 2B seqNo) = 1 + 3N
-    return (1 + 3 * GetDestCount());
+    // Compressed: 2B flags + N * (1B dstNodeId + 2B seqNo) = 2 + 3N
+    // Byte 0: [N(1) | AM_d(3) | A(1) | destCount_hi(3)]
+    // Byte 1: [destCount_lo(5) | reserved(3)]
+    return (2 + 3 * GetDestCount());
 }
 
 void
 ERerrHeader::Serialize(Buffer::Iterator i) const
 {
-    // ESC flags byte layout:
-    //   bit 0     = N (noDelete flag)
-    //   bits 1-2  = AM_d (address mode for destinations, fixed AM=11 for ns-3 k=1)
-    //   bit 3     = A (ambiguity flag, reserved for ESC collision handling)
-    //   bits 4-7  = destCount (4 bits, max 15; capped on serialize)
-    uint8_t count = std::min(static_cast<uint8_t>(15), GetDestCount());
-    uint8_t packed = (m_flag & 0x01)   // bit 0: N
-                   | (0x03 << 1)       // bits 1-2: AM=11 (1-byte suffix)
-                   | (0 << 3)          // bit 3: A=0 (no ambiguity)
-                   | (count << 4);     // bits 4-7: destCount
-    i.WriteU8(packed);
+    // 2-byte flags layout (3-bit AM):
+    //   byte 0: bit 7 = N, bits 6-4 = AM_d (111), bit 3 = A, bits 2-0 = destCount high 3 bits
+    //   byte 1: bits 7-3 = destCount low 5 bits, bits 2-0 = reserved
+    uint8_t count = GetDestCount(); // now supports up to 255
+    uint8_t byte0 = ((m_flag & 0x01) << 7) // bit 7: N
+                   | (0x07 << 4)            // bits 6-4: AM=111 (1-byte suffix)
+                   | (0 << 3)              // bit 3: A=0 (no ambiguity)
+                   | ((count >> 5) & 0x07); // bits 2-0: destCount high 3
+    uint8_t byte1 = (count & 0x1F) << 3;   // bits 7-3: destCount low 5, bits 2-0: reserved
+    i.WriteU8(byte0);
+    i.WriteU8(byte1);
 
     uint8_t written = 0;
     for (auto j = m_unreachableDstSeqNo.begin();
@@ -678,12 +682,13 @@ uint32_t
 ERerrHeader::Deserialize(Buffer::Iterator start)
 {
     Buffer::Iterator i = start;
-    uint8_t packed = i.ReadU8();
-    m_flag = packed & 0x01;            // bit 0: N
+    uint8_t byte0 = i.ReadU8();
+    uint8_t byte1 = i.ReadU8();
+    m_flag = (byte0 >> 7) & 0x01;      // bit 7: N
     m_reserved = 0;
-    // bits 1-2: AM_d (ignored in ns-3, always k=1)
+    // bits 6-4: AM_d (ignored in ns-3, always k=1)
     // bit 3: A (ambiguity flag, ignored for now)
-    uint8_t dest = (packed >> 4) & 0x0F;  // bits 4-7: destCount (max 15)
+    uint8_t dest = ((byte0 & 0x07) << 5) | ((byte1 >> 3) & 0x1F);  // 8-bit destCount
     m_unreachableDstSeqNo.clear();
     for (uint8_t k = 0; k < dest; ++k)
     {
@@ -899,13 +904,16 @@ SyncOfferHeader::GetInstanceTypeId() const
 uint32_t
 SyncOfferHeader::GetSerializedSize() const
 {
-    // Compressed: 1B mentorNodeId + 1B gttSize + 1B menteeNodeId = 3
-    return 3;
+    // Compressed: 1B AM(mentor+mentee) + 1B mentorNodeId + 1B gttSize + 1B menteeNodeId = 4
+    // AM byte: [3b AM_mentor | 3b AM_mentee | 2b reserved]
+    return 4;
 }
 
 void
 SyncOfferHeader::Serialize(Buffer::Iterator i) const
 {
+    // AM byte: both addresses use AM=111 (1-byte suffix)
+    i.WriteU8(0xFC); // 111_111_00
     i.WriteU8(CompressedEncoding::IpToNodeId(m_mentorAddr));
     i.WriteU8(static_cast<uint8_t>(std::min(m_gttSize, 255u)));
     i.WriteU8(CompressedEncoding::IpToNodeId(m_menteeAddr));
@@ -915,6 +923,7 @@ uint32_t
 SyncOfferHeader::Deserialize(Buffer::Iterator start)
 {
     Buffer::Iterator i = start;
+    i.ReadU8(); // AM byte (skip — fixed AM=111 for both addresses)
     m_mentorAddr = CompressedEncoding::NodeIdToIp(i.ReadU8());
     m_gttSize = static_cast<uint32_t>(i.ReadU8());
     m_menteeAddr = CompressedEncoding::NodeIdToIp(i.ReadU8());
@@ -1147,13 +1156,16 @@ TcUpdateHeader::GetInstanceTypeId() const
 uint32_t
 TcUpdateHeader::GetSerializedSize() const
 {
-    // Compressed: 1B originNodeId + 2B seqNo + 1B subjectNodeId + 1B eventType + 2B timestamp = 7
-    return 7;
+    // Compressed: 1B AM(origin+subject) + 1B originNodeId + 2B seqNo + 1B subjectNodeId + 1B eventType + 2B timestamp = 8
+    // AM byte: [3b AM_origin | 3b AM_subject | 2b reserved]
+    return 8;
 }
 
 void
 TcUpdateHeader::Serialize(Buffer::Iterator i) const
 {
+    // AM byte: both addresses use AM=111 (1-byte suffix)
+    i.WriteU8(0xFC); // 111_111_00
     i.WriteU8(CompressedEncoding::IpToNodeId(m_originAddr));
     i.WriteHtonU16(CompressedEncoding::CompressSeqNo(m_seqNo));
     i.WriteU8(CompressedEncoding::IpToNodeId(m_subjectAddr));
@@ -1165,6 +1177,7 @@ uint32_t
 TcUpdateHeader::Deserialize(Buffer::Iterator start)
 {
     Buffer::Iterator i = start;
+    i.ReadU8(); // AM byte (skip — fixed AM=111 for both addresses)
     m_originAddr = CompressedEncoding::NodeIdToIp(i.ReadU8());
     m_seqNo = CompressedEncoding::ExpandSeqNo(i.ReadNtohU16());
     m_subjectAddr = CompressedEncoding::NodeIdToIp(i.ReadU8());

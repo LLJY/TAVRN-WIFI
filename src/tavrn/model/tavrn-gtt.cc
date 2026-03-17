@@ -75,12 +75,14 @@ GlobalTopologyTable::AddOrUpdateEntry(Ipv4Address addr, uint32_t seqNo, uint16_t
         Time effectiveTtl = (it->second.perNodeTtl.IsStrictlyPositive())
                                 ? it->second.perNodeTtl
                                 : m_defaultTtl;
-        Time softOffset = Seconds(effectiveTtl.GetSeconds() * m_softExpiryThreshold);
+        Time jitteredTtl = JitteredTtl(effectiveTtl);
+        Time softOffset = Seconds(jitteredTtl.GetSeconds() * m_softExpiryThreshold);
 
         NS_LOG_LOGIC("Updating GTT entry for " << addr << " seqNo " << seqNo
-                     << " effectiveTtl=" << effectiveTtl.As(Time::S));
+                     << " effectiveTtl=" << effectiveTtl.As(Time::S)
+                     << " jittered=" << jitteredTtl.As(Time::S));
         it->second.lastSeen = now;
-        it->second.ttlExpiry = now + effectiveTtl;
+        it->second.ttlExpiry = now + jitteredTtl;
         it->second.softExpiry = now + softOffset;
         it->second.seqNo = seqNo;
         it->second.hopCount = hopCount;
@@ -98,9 +100,10 @@ GlobalTopologyTable::AddOrUpdateEntry(Ipv4Address addr, uint32_t seqNo, uint16_t
     }
 
     // New entry — uses table default TTL (perNodeTtl starts at 0 = "use default")
-    Time softOffset = Seconds(m_defaultTtl.GetSeconds() * m_softExpiryThreshold);
+    Time jitteredTtl = JitteredTtl(m_defaultTtl);
+    Time softOffset = Seconds(jitteredTtl.GetSeconds() * m_softExpiryThreshold);
     Time newSoftExpiry = now + softOffset;
-    Time newTtlExpiry = now + m_defaultTtl;
+    Time newTtlExpiry = now + jitteredTtl;
 
     NS_LOG_LOGIC("Adding new GTT entry for " << addr << " seqNo " << seqNo);
     GttEntry entry(addr, now, newTtlExpiry, newSoftExpiry, seqNo, hopCount);
@@ -294,11 +297,12 @@ GlobalTopologyTable::RefreshEntry(Ipv4Address addr, uint32_t seqNo)
     Time effectiveTtl = (it->second.perNodeTtl.IsStrictlyPositive())
                             ? it->second.perNodeTtl
                             : m_defaultTtl;
+    Time jitteredTtl = JitteredTtl(effectiveTtl);
 
     Time now = Simulator::Now();
-    Time softOffset = Seconds(effectiveTtl.GetSeconds() * m_softExpiryThreshold);
+    Time softOffset = Seconds(jitteredTtl.GetSeconds() * m_softExpiryThreshold);
     it->second.lastSeen = now;
-    it->second.ttlExpiry = now + effectiveTtl;
+    it->second.ttlExpiry = now + jitteredTtl;
     it->second.softExpiry = now + softOffset;
     it->second.seqNo = seqNo;
 
@@ -315,7 +319,8 @@ GlobalTopologyTable::RefreshEntry(Ipv4Address addr, uint32_t seqNo)
     }
 
     NS_LOG_LOGIC("Refreshed GTT entry for " << addr << " effectiveTtl="
-                 << effectiveTtl.As(Time::S) << " new ttlExpiry="
+                 << effectiveTtl.As(Time::S) << " jittered="
+                 << jitteredTtl.As(Time::S) << " new ttlExpiry="
                  << it->second.ttlExpiry.As(Time::S));
 }
 
@@ -687,6 +692,31 @@ GlobalTopologyTable::Purge()
         NS_LOG_LOGIC("Purged " << removedCount << " departed entries");
         m_sizeChangeTrace(NodeCount());
     }
+}
+
+// ===========================================================================
+//  TTL jitter — desynchronization for large non-hub topologies
+// ===========================================================================
+
+void
+GlobalTopologyTable::SetJitterRng(Ptr<UniformRandomVariable> rng)
+{
+    NS_LOG_FUNCTION(this << rng);
+    m_jitterRng = rng;
+}
+
+Time
+GlobalTopologyTable::JitteredTtl(Time baseTtl) const
+{
+    if (!m_jitterRng)
+    {
+        return baseTtl;
+    }
+    // Add uniform(0, baseTtl/6) jitter.  At 300s TTL this gives 0-50s of
+    // spread, enough to desynchronize mass bootstrap expiry across a
+    // maintenance interval (~25s) without materially increasing staleness.
+    double jitterSec = m_jitterRng->GetValue(0.0, baseTtl.GetSeconds() / 6.0);
+    return baseTtl + Seconds(jitterSec);
 }
 
 } // namespace tavrn

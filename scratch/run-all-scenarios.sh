@@ -13,7 +13,7 @@
 # With --baseline=FILE: only runs TAVRN, merges AODV/OLSR/DSDV from the
 # baseline CSV. Saves ~75% of simulation time when iterating on TAVRN only.
 #
-set -euo pipefail
+set -uo pipefail
 
 # Resolve ns-3 root directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -95,6 +95,18 @@ SCENARIOS=(
   "home-medium|--scenario=home --nNodes=30 --nFlows=8 --dataRate=1 --hubTraffic=true"
   "home-large|--scenario=home --nNodes=50 --nFlows=12 --dataRate=1 --hubTraffic=true"
   "home-hell|--scenario=home --nNodes=50 --nFlows=12 --dataRate=1 --hubTraffic=true --churnNodes=1 --churnInterval=60"
+
+  # H. Constrained MTU (802.15.4 = 127B)
+  # packetSize=80 fits within 127B MTU after IP(20)+UDP(8) headers = 99B budget
+  "mtu127-small|--scenario=grid --nNodes=9 --nFlows=3 --areaSize=300 --mtu=127 --packetSize=80"
+  "mtu127-medium|--scenario=grid --nNodes=25 --nFlows=5 --areaSize=500 --mtu=127 --packetSize=80"
+  "mtu127-large|--scenario=grid --nNodes=49 --nFlows=10 --areaSize=700 --mtu=127 --packetSize=80"
+  "mtu127-home-small|--scenario=home --nNodes=15 --nFlows=5 --dataRate=1 --hubTraffic=true --mtu=127 --packetSize=80"
+  "mtu127-home-medium|--scenario=home --nNodes=30 --nFlows=8 --dataRate=1 --hubTraffic=true --mtu=127 --packetSize=80"
+  "mtu127-home-large|--scenario=home --nNodes=50 --nFlows=12 --dataRate=1 --hubTraffic=true --mtu=127 --packetSize=80"
+  "mtu127-mobile-slow|--scenario=mobile --nNodes=25 --nFlows=5 --areaSize=500 --maxSpeed=1.0 --pauseTime=5.0 --mtu=127 --packetSize=80"
+  "mtu127-node-failure|--scenario=grid --nNodes=25 --nFlows=5 --areaSize=500 --failNodes=5 --failTime=300 --mtu=127 --packetSize=80"
+  "mtu127-bursty|--scenario=grid --nNodes=25 --nFlows=5 --areaSize=500 --onTime=5 --offTime=15 --mtu=127 --packetSize=80"
 )
 
 TOTAL_SCENARIOS=${#SCENARIOS[@]}
@@ -112,7 +124,11 @@ echo ""
 
 # Temp dir for per-job output
 TMPDIR=$(mktemp -d)
-trap 'rm -rf "$TMPDIR"' EXIT
+LOG_ARCHIVE="${RESULTS_DIR}/logs-${TIMESTAMP}"
+cleanup() {
+  rm -rf "$TMPDIR"
+}
+trap cleanup EXIT
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Launch all jobs with FIFO-based semaphore (bulletproof throttle)
@@ -183,6 +199,15 @@ ELAPSED=$((SECONDS - START_TIME))
 echo ""
 echo "All jobs finished in ${ELAPSED}s ($((ELAPSED / 60))m $((ELAPSED % 60))s)"
 echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Archive temporal logs (before CSV collection so they're available for plotting)
+# ─────────────────────────────────────────────────────────────────────────────
+if [[ "$SAMPLE_INTERVAL" != "0" && -d "$TMPDIR" ]]; then
+  mkdir -p "$LOG_ARCHIVE"
+  cp "$TMPDIR"/*.log "$LOG_ARCHIVE/" 2>/dev/null || true
+  echo "Temporal logs saved to: ${LOG_ARCHIVE}/"
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Collect results in scenario order
@@ -436,3 +461,22 @@ echo ""
 echo "Done! Files:"
 echo "  CSV:   ${CSV_FILE}"
 echo "  Table: ${TABLE_FILE}"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Generate temporal figures (if sampling was enabled and logs exist)
+# ─────────────────────────────────────────────────────────────────────────────
+if [[ "$SAMPLE_INTERVAL" != "0" && -d "$LOG_ARCHIVE" ]]; then
+  FIGURES_DIR="${RESULTS_DIR}/figures-${TIMESTAMP}"
+  PLOT_SCRIPT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../scripts" && pwd)/plot-temporal.py"
+  if [[ -f "$PLOT_SCRIPT" ]]; then
+    echo ""
+    echo "Generating temporal figures..."
+    if python3 "$PLOT_SCRIPT" "$LOG_ARCHIVE" --csv="$CSV_FILE" --outdir="$FIGURES_DIR"; then
+      echo "Figures saved to: ${FIGURES_DIR}/"
+    else
+      echo "WARNING: Figure generation failed (exit $?). Data files are still available."
+    fi
+  else
+    echo "WARNING: plot-temporal.py not found at ${PLOT_SCRIPT}, skipping figure generation."
+  fi
+fi

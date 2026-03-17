@@ -250,6 +250,7 @@ RoutingProtocol::RoutingProtocol()
       m_rerrRateLimitTimer(Timer::CANCEL_ON_DESTROY)
 {
     m_uniformRandomVariable = CreateObject<UniformRandomVariable>();
+    m_gtt.SetJitterRng(m_uniformRandomVariable);
 }
 
 RoutingProtocol::~RoutingProtocol()
@@ -3523,6 +3524,13 @@ RoutingProtocol::CheckGttExpiry()
         myAddr = m_socketAddresses.begin()->second.GetLocal();
     }
 
+    // Per-cycle verification cap: limit how many NEW verifications we start
+    // per maintenance cycle to prevent broadcast storms when many entries
+    // expire simultaneously (e.g., post-bootstrap in non-hub topologies).
+    // Existing verifications (stage advancement / give-up) are uncapped.
+    static constexpr uint8_t kMaxNewVerificationsPerCycle = 4;
+    uint8_t newVerificationsThisCycle = 0;
+
     // Get hard-expired entries and handle verification
     std::vector<GttEntry> hardExpired = m_gtt.GetHardExpiredEntries();
     for (const auto& entry : hardExpired)
@@ -3534,36 +3542,23 @@ RoutingProtocol::CheckGttExpiry()
         }
 
         // ---------------------------------------------------------------
-        // Demand check FIRST — before any route or verification logic.
-        // If nobody needs this node, let it expire silently regardless
-        // of whether a route exists.  A future RREQ will rediscover AND
-        // refresh the GTT entry in one shot if demand appears later.
-        // ---------------------------------------------------------------
-        bool hasDemand = m_queue.Find(entry.nodeAddr);
-        if (!hasDemand)
-        {
-            // Check if this node is used as a gateway by any active route
-            std::map<Ipv4Address, uint32_t> affectedDsts;
-            m_routingTable.GetListOfDestinationWithNextHop(entry.nodeAddr, affectedDsts);
-            hasDemand = !affectedDsts.empty();
-        }
-
-        if (!hasDemand)
-        {
-            // No active interest — expire silently.
-            NS_LOG_DEBUG("GTT hard-expired for " << entry.nodeAddr
-                         << " — no demand. Expiring silently.");
-            m_gtt.MarkDeparted(entry.nodeAddr);
-            m_verificationState.erase(entry.nodeAddr);
-            continue;
-        }
-
-        // ---------------------------------------------------------------
-        // Multi-stage verification for entries with active demand.
+        // Multi-stage verification for ALL hard-expired entries.
+        // Stage 0: unicast verification via existing route (cheap).
+        // Stage 1: RREQ with Smart TTL, then ERS fallback (expensive).
+        // Failure: mark departed, broadcast TC_UPDATE(NODE_LEAVE).
         // ---------------------------------------------------------------
         auto vit = m_verificationState.find(entry.nodeAddr);
         if (vit == m_verificationState.end())
         {
+            // Cap new verification initiations per cycle to prevent
+            // broadcast storms from synchronized mass expiry.
+            if (newVerificationsThisCycle >= kMaxNewVerificationsPerCycle)
+            {
+                NS_LOG_DEBUG("Verification cap reached, deferring " << entry.nodeAddr
+                             << " to next cycle");
+                continue;
+            }
+
             // First time seeing this hard-expired entry with demand.
             // Try stage 0: unicast verification via the still-valid route.
             VerificationInfo vi;
@@ -3577,6 +3572,7 @@ RoutingProtocol::CheckGttExpiry()
             {
                 // Route was valid — unicast sent (cheapest path)
                 m_verificationState[entry.nodeAddr] = vi;
+                ++newVerificationsThisCycle;
             }
             else
             {
@@ -3585,8 +3581,13 @@ RoutingProtocol::CheckGttExpiry()
                 {
                     vi.stage = 1;
                     m_verificationState[entry.nodeAddr] = vi;
+                    ++newVerificationsThisCycle;
                     NS_LOG_DEBUG("Stage 1 (no route for unicast): RREQ for " << entry.nodeAddr);
                     SendRequest(entry.nodeAddr);
+                }
+                else
+                {
+                    NS_LOG_DEBUG("Stage 0->1 blocked by rate limit for " << entry.nodeAddr);
                 }
                 // else: rate-limited, skip — do NOT create state without sending
             }
@@ -4327,8 +4328,6 @@ RoutingProtocol::NotifyTxError(WifiMacDropReason reason, Ptr<const WifiMpdu> mpd
     // for queue-management drops that are not actual link failures.
     if (reason != WIFI_MAC_DROP_REACHED_RETRY_LIMIT)
     {
-        NS_LOG_DEBUG("NotifyTxError: drop reason " << static_cast<int>(reason)
-                     << " is not retry-limit — ignoring");
         return;
     }
 

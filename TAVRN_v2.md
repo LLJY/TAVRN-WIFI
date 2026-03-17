@@ -106,15 +106,19 @@ The entropy computation is **deterministic**: given the same GTT contents, every
 
 ### Address Mode (AM) Field
 
-Inspired by IPHC's SAM/DAM encoding, each address field in a TAVRN header carries a **2-bit Address Mode (AM)** that tells the receiver how many bytes follow:
+Inspired by IPHC's SAM/DAM encoding, each address field in a TAVRN header carries a **3-bit Address Mode (AM)** that tells the receiver how many bytes follow:
 
 ```
-AM  Inline Bytes  Usage
---  ------------  -----
-11  1 byte         Suffix-1: covers /24 networks, most IoT deployments
-10  2 bytes        Suffix-2: covers /16 networks, multi-subnet meshes
-01  8 bytes        Suffix-8: IPv6 interface ID (prefix elided)
-00  16 bytes       Full address: IPv6 (128-bit) or IPv4 (4 bytes, zero-padded)
+AM   Inline Bytes  Usage
+---  ------------  -----
+111  1 byte         Suffix-1: covers /24 networks, most IoT deployments
+110  2 bytes        Suffix-2: covers /16 networks, multi-subnet meshes
+101  3 bytes        Half MAC (OUI-stripped MAC-24 suffix)
+100  4 bytes        Full IPv4 address
+011  6 bytes        Full MAC-48 address
+010  8 bytes        Half IPv6 (interface ID, prefix elided)
+001  16 bytes       Full IPv6 address (128-bit)
+000  (reserved)
 ```
 
 The AM bits are packed into existing flag/control bytes in each header (see Message Types). For headers with two address fields (e.g., E_RREQ: origin + destination), both AM values are packed into a single byte alongside other flags.
@@ -124,12 +128,15 @@ The AM bits are packed into existing flag/control bytes in each header (see Mess
 ### Sender Behavior
 
 1. **Compute entropy** `k` from own GTT: find the minimum suffix bytes for all known addresses to be unique.
-2. **Select AM** for each address field based on `k`:
-   - `k = 1` -> `AM = 11` (1 byte)
-   - `k = 2` -> `AM = 10` (2 bytes)
-   - `k <= 8` -> `AM = 01` (8 bytes)
-   - Otherwise -> `AM = 00` (full address)
-3. **Exception**: if the address is **not in the sender's GTT** (unknown node, e.g., RREQ for a node discovered via application hint), use `AM = 00` (full address). You cannot suffix-compress what you have not verified as unique.
+2. **Select AM** for each address field based on `k` and the L2/L3 address type:
+   - `k = 1` -> `AM = 111` (1 byte)
+   - `k = 2` -> `AM = 110` (2 bytes)
+   - `k = 3` (half MAC) -> `AM = 101` (3 bytes)
+   - Full IPv4 -> `AM = 100` (4 bytes)
+   - Full MAC-48 -> `AM = 011` (6 bytes)
+   - `k <= 8` (half IPv6) -> `AM = 010` (8 bytes)
+   - Full IPv6 -> `AM = 001` (16 bytes)
+3. **Exception**: if the address is **not in the sender's GTT** (unknown node, e.g., RREQ for a node discovered via application hint), use the full-address AM for the address type (`100` for IPv4, `011` for MAC, `001` for IPv6). You cannot suffix-compress what you have not verified as unique.
 
 ### Receiver Behavior
 
@@ -153,11 +160,11 @@ A suffix collision occurs when a receiver's GTT contains multiple nodes whose ad
 Example collision flow:
 
 Network: 10.1.1.0/24 + 10.1.2.0/24 (two subnets)
-Node B (stale GTT, k=1) -> E_RREQ [dest=0x05, AM=11]
+Node B (stale GTT, k=1) -> E_RREQ [dest=0x05, AM=111]
 Node A (full GTT, k=2)  -> suffix 0x05 matches 10.1.1.5 AND 10.1.2.5
 Node A -> E_RERR [A=1, topology metadata includes both full addresses]
 Node B -> updates GTT, k bumps to 2
-Node B -> E_RREQ [dest=0x0105, AM=10] -> resolves unambiguously
+Node B -> E_RREQ [dest=0x0105, AM=110] -> resolves unambiguously
 ```
 
 This mirrors 6LoWPAN's fallback to full EUI-64 addresses on conflict, but TAVRN detects and resolves collisions automatically through existing error recovery mechanisms rather than requiring coordinator intervention.
@@ -173,9 +180,9 @@ This mirrors 6LoWPAN's fallback to full EUI-64 addresses on conflict, but TAVRN 
 
 During bootstrap, a new node has no GTT and cannot compute entropy:
 
-- **HELLO**: always uses `AM = 00` (full L3 address). The new node announces itself with its complete address so existing nodes can add it to their GTTs.
-- **SYNC_OFFER**: mentor uses `AM = 00` for the mentee's address (the mentee may not know the network's entropy yet).
-- **SYNC_DATA**: always uses `AM = 00` (full L3 addresses) for all GTT entries. SYNC_DATA builds the mentee's GTT from scratch; the mentee needs full addresses to populate its context table.
+- **HELLO**: always uses full-address AM (`100` for IPv4, `001` for IPv6). The new node announces itself with its complete address so existing nodes can add it to their GTTs.
+- **SYNC_OFFER**: mentor uses full-address AM for the mentee's address (the mentee may not know the network's entropy yet).
+- **SYNC_DATA**: always uses full-address AM for all GTT entries. SYNC_DATA builds the mentee's GTT from scratch; the mentee needs full addresses to populate its context table.
 - **Post-mentorship**: once the mentee has a populated GTT, it computes `k` and switches to suffix compression for all subsequent messages.
 
 ### Wire Format Impact
@@ -195,7 +202,7 @@ Address compression is the primary saving. Other field compressions (sequence nu
 
 In the ns-3 simulation environment (WiFi + IPv4 on a 10.1.1.0/24 subnet):
 - Entropy is always `k = 1` (last octet uniquely identifies each node)
-- All address fields use `AM = 11` (1-byte suffix)
+- All address fields use `AM = 111` (1-byte suffix)
 - `suffix = ipv4_addr.Get() & 0xFF` (last octet)
 - `full_addr = network_prefix | suffix` (reverse mapping)
 - The network prefix is set once during `RoutingProtocol::Start()`
@@ -258,7 +265,7 @@ TAVRN mechanisms mirror how humans and social animals maintain relationships:
 
 ## Message Types
 
-All headers use ESC (Entropy-Based Suffix Compression) for address fields on the wire. Each address field is preceded by a 2-bit AM (Address Mode) packed into the header's flags byte. Sequence numbers are 16-bit. See "Addressing: Entropy-Based Suffix Compression (ESC)" for details.
+All headers use ESC (Entropy-Based Suffix Compression) for address fields on the wire. Each address field is preceded by a 3-bit AM (Address Mode) packed into the header's flags byte. Sequence numbers are 16-bit. See "Addressing: Entropy-Based Suffix Compression (ESC)" for details.
 
 Wire sizes below are shown for `k=1` (1-byte suffixes, typical /24 IoT network). Sizes scale with entropy: at `k=2`, each address field adds 1 byte.
 
@@ -266,7 +273,7 @@ Wire sizes below are shown for `k=1` (1-byte suffixes, typical /24 IoT network).
 |---------|---------|----------|------------------|---------|
 | E_RREQ | 1 | Routing + Topology | **10B** | Route request: `[1B flags+AM][1B hop][2B reqId][kB dst][2B dstSeq][kB origin][2B originSeq]` |
 | E_RREP | 2 | Routing + Topology | **8B** | Route reply: `[1B flags+AM][1B hop][kB dst][2B dstSeq][kB origin][2B lifetime]` |
-| E_RERR | 3 | Routing + Topology | **1 + 3N** | Route error: `[1B flags+A+count][N * (kB dst + 2B seqNo)]`. **A flag**: address ambiguity (see ESC Collision Handling) |
+| E_RERR | 3 | Routing + Topology | **2 + 3N** | Route error: `[2B flags+A+count][N * (kB dst + 2B seqNo)]`. **A flag**: address ambiguity (see ESC Collision Handling) |
 | HELLO | 4 | Topology | **4B** | Node announcement: `[kB node][2B seqNo][1B flags]` (bootstrap: AM=00, full address) |
 | SYNC_OFFER | 5 | Topology | **3B** | Mentor offers sync: `[kB mentor][1B gttSize][kB mentee]` |
 | SYNC_PULL | 6 | Topology | **2B** | Request page: `[1B index][1B count]` |
@@ -277,18 +284,20 @@ Wire sizes below are shown for `k=1` (1-byte suffixes, typical /24 IoT network).
 ### E_RERR Flags Byte
 
 ```
- 0   1   2   3   4   5   6   7
-+---+---+---+---+---+---+---+---+
-| N |  AM_d | A |   destCount   |
-+---+---+---+---+---+---+---+---+
+ 0   1   2   3   4   5   6   7     8   9  10  11  12  13  14  15
++---+---+---+---+---+---+---+---+ +---+---+---+---+---+---+---+---+
+| N |   AM_d    | A |        destCount               | (reserved)  |
++---+---+---+---+---+---+---+---+ +---+---+---+---+---+---+---+---+
 
-N (1 bit):    No-delete flag (standard AODV behavior)
-AM_d (2 bits): Address Mode for destination entries
-A (1 bit):    Ambiguity flag -- set when RERR is caused by suffix collision
-              (receiver detected multiple GTT matches for a compressed address).
-              Signals sender to increase entropy and retry.
-destCount (4 bits): Number of unreachable destinations (0-15)
+N (1 bit):     No-delete flag (standard AODV behavior)
+AM_d (3 bits): Address Mode for destination entries
+A (1 bit):     Ambiguity flag -- set when RERR is caused by suffix collision
+               (receiver detected multiple GTT matches for a compressed address).
+               Signals sender to increase entropy and retry.
+destCount (8 bits): Number of unreachable destinations (0-255)
 ```
+
+Note: expanding AM_d to 3 bits required widening the flags to 2 bytes. This also allows destCount to grow from 4 bits (max 15) to 8 bits (max 255), removing the previous serialization cap.
 
 ### Size Comparison with AODV (IPv4)
 
@@ -296,18 +305,18 @@ destCount (4 bits): Number of unreachable destinations (0-15)
 |--------|-------------|-------------|-------------|-------------|
 | RREQ bare | 24B | 10B | 12B | 0.42x |
 | RREP | 20B | 8B | 10B | 0.40x |
-| RERR (1 dest) | 12B | 4B | 5B | 0.33x |
-| RREQ + 4 metadata | n/a | 19B | 23B | 0.79x vs AODV RREQ |
+| RERR (1 dest) | 12B | 5B | 6B | 0.42x |
+| RREQ + 4 metadata | n/a | 20B | 24B | 0.83x vs AODV RREQ |
 
-TAVRN's E_RREQ with full topology piggybacking (4 entries) at k=1 is **5 bytes smaller** than a bare AODV RREQ. At k=2, it is still 1 byte smaller.
+TAVRN's E_RREQ with full topology piggybacking (4 entries) at k=1 is **4 bytes smaller** than a bare AODV RREQ. At k=2, it is equal.
 
 ### Topology Metadata Extension
 
 Piggybacked on E_RREQ, E_RREP, and E_RERR messages. Also piggybacked on data packets when conditional piggybacking is active.
 
-Wire format: `[1B count+AM][N * (kB suffix + 1B packed{4-bit TTL bucket | 4-bit flags})]` = **1 + (k+1)N bytes**.
+Wire format: `[1B count][1B AM+flags][N * (kB suffix + 1B packed{4-bit TTL bucket | 4-bit flags})]` = **2 + (k+1)N bytes**.
 
-The AM for metadata entries is shared (all entries in one extension use the same AM, packed into the count byte).
+The AM for metadata entries is shared (all entries in one extension use the same 3-bit AM).
 
 TTL bucket encoding: `bucket = min(15, ttl_seconds / 20)`, decode: `ttl = bucket * 20`. Max encodable: 300s.
 
@@ -340,7 +349,7 @@ AODV-based reactive routing with the following TAVRN extensions:
 
 **Passive Topology Learning**: Every received packet -- data, control, forwarded -- updates the GTT. The previous hop (from shim tag or reverse route), the IP source, RREQ originators, RREP destinations, RERR senders, and TC-UPDATE forwarders all trigger GTT refresh. This provides continuous topology maintenance as a side effect of normal operation.
 
-**Route-Check Bypass**: When a GTT entry reaches hard expiry but a valid route to that node still exists (ActiveRouteTimeout > GttTtl), the route itself proves reachability. The GTT entry is silently refreshed without sending a verification E_RREQ, avoiding unnecessary broadcast floods.
+**Route-Assisted Verification**: When a GTT entry reaches hard expiry and a valid route to that node still exists, the route is used for cheap unicast verification (a targeted HELLO with freshness-request metadata) instead of an expensive broadcast RREQ. If the node responds, the GTT entry is refreshed. If an E_RERR is received (route broken), verification escalates to a bounded RREQ. If all verification fails, the node is marked departed and TC_UPDATE(LEAVE) is broadcast.
 
 ---
 
@@ -405,15 +414,15 @@ Each GTT entry has a Time-To-Live with two expiry classes:
 - **Tier 3**: Nodes with marginally higher TTL suppress response (let fresher sources answer)
 
 **Hard Expiry (TTL reaches 0):**
-- First check: if a valid route exists to the node (ActiveRouteTimeout > GttTtl), silently refresh the GTT entry (route proves reachability)
-- If no route: begin bounded probe-based verification
-  - Send targeted E_RREQ to verify node existence
+- Stage 0 — route-assisted unicast verification: if a valid route exists to the node, send a targeted unicast HELLO with freshness-request metadata via that route. This is cheap (single unicast, no broadcast). If a freshness response or any evidence of liveness arrives, refresh the GTT entry and cancel verification.
+- Stage 1 — bounded RREQ verification: if stage 0 fails (E_RERR, timeout, or no route exists), send a targeted E_RREQ using Smart TTL (GTT hop estimate + 2), falling back to Expanding Ring Search if needed.
   - Wait 2x net traversal time between probes
   - Maximum 2 retry probes (3 total attempts including initial)
   - Response received at any point: refresh GTT entry, cancel verification
   - No response after all retries: mark node as departed, broadcast TC-UPDATE(NODE_LEAVE)
+- Per-cycle cap: max 4 new verification starts per maintenance cycle to prevent storms during mass expiry events.
 
-**Key property**: In active networks, soft expiry resolves via piggybacked metadata. Standalone control packets only occur at hard expiry, and even then are suppressed when valid routes exist.
+**Key property**: In active networks, soft expiry resolves via piggybacked metadata. Hard expiry verification is bounded and distributed: stage 0 costs one unicast, stage 1 costs one RREQ. The per-cycle cap ensures verification overhead stays O(1) per maintenance interval regardless of network size.
 
 ### 3. Passive Topology Learning
 
@@ -566,7 +575,7 @@ Several timers are computed from base parameters:
 
 | Derived Timer | Formula | Purpose |
 |---------------|---------|---------|
-| ActiveRouteTimeout | 2 * GttTtl | Routes outlive GTT entries for route-check bypass |
+| ActiveRouteTimeout | 1.2 * GttTtl | Routes outlive GTT entries for route-assisted verification |
 | HelloInterval | 0.5 * GttTtl (default) | Soft-expiry duty cycle |
 | NetTraversalTime | 2 * NetDiameter * NodeTraversalTime | RREQ round-trip bound |
 | PathDiscoveryTime | 2 * NetTraversalTime | RREQ ID cache lifetime |
@@ -584,7 +593,7 @@ Several timers are computed from base parameters:
 | Network idle, topology stable | Periodic HELLO at configured interval (if enabled) |
 | Network idle, topology decaying | Soft-expiry requests piggybacked on next outgoing traffic; HELLOs if no traffic |
 | Topology change (node join/leave) | Single TC-UPDATE flood (TTL-bounded, subject-deduplicated) |
-| Hard expiry, valid route exists | **Zero** (route-check bypass silently refreshes GTT) |
+| Hard expiry, valid route exists | **1 unicast** (route-assisted verification HELLO) |
 | Hard expiry, no route | 1-3 targeted E_RREQ verification probes per expiring entry |
 
 ---
@@ -641,7 +650,7 @@ Departed entries are retained for `2 * GttTtl` after departure to give TC-UPDATE
 
 | Failure | Behavior | Mitigation |
 |---------|----------|------------|
-| Network goes quiet | Soft expiries accumulate, triggering verification traffic | Acceptable: verification is distributed over time; route-check bypass absorbs many |
+| Network goes quiet | Soft expiries accumulate, triggering verification traffic | Acceptable: verification is distributed over time; route-assisted unicast absorbs many |
 | Traffic is localized (A<->B active, C silent) | C's view of A and B stays fresh via passive learning; A and B's view of C decays | C will be verified at hard expiry; periodic HELLO prevents this in default config |
 | Partition heals | Nodes have divergent GTTs | TC-UPDATEs propagate; full resync via mentorship if drift is severe |
 | High churn | Frequent TC-UPDATEs | TAVRN is not designed for high churn; subject-based dedup reduces storm amplification |
@@ -660,7 +669,7 @@ Departed entries are retained for `2 * GttTtl` after departure to give TC-UPDATE
 | Routing table | O(active destinations) | Standard AODV behavior |
 | Message overhead (active, stable) | O(0) per data message | Conditional piggybacking: clean when stable |
 | Message overhead (active, refreshing) | O(1) per data message | Fixed metadata size (1 + 7*MaxEntries bytes) |
-| Message overhead (idle) | O(N / GttTtl) | Amortized verification, reduced by route-check bypass |
+| Message overhead (idle) | O(N / GttTtl) | Amortized verification, reduced by route-assisted unicast |
 | Convergence (topology change) | O(diameter) | TC-UPDATE flood with TTL decrement |
 | Bootstrap | O(N / SyncPageSize) | Paginated pull; 15 entries/page default |
 
@@ -731,7 +740,7 @@ TAVRN v2.1 is a mesh network protocol occupying the underserved space between pu
 - **Tunable reactivity** from near-AODV silence to near-OLSR freshness
 - **Explicit resource trade-off**: memory and CPU for radio silence
 - **Smart route discovery**: GTT-assisted TTL skips expanding ring search
-- **Graceful degradation**: route-check bypass, bounded verification, subject-based dedup
+- **Graceful degradation**: route-assisted verification, bounded RREQ fallback, subject-based dedup
 
 TAVRN is designed for medium-sized, relatively stable MANETs where topology awareness is required but continuous control traffic is unacceptable.
 

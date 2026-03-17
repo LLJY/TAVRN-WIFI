@@ -17,6 +17,7 @@
 #include "ns3/ipv4-address.h"
 #include "ns3/nstime.h"
 #include "ns3/output-stream-wrapper.h"
+#include "ns3/random-variable-stream.h"
 #include "ns3/simulator.h"
 #include "ns3/traced-callback.h"
 
@@ -375,6 +376,18 @@ class GlobalTopologyTable
     Time GetDefaultTtl() const;
 
     /**
+     * @brief Set the random variable used for TTL jitter.
+     *
+     * When set, every AddOrUpdateEntry / RefreshEntry call adds
+     * uniform(0, defaultTtl/6) jitter to the TTL.  This desynchronizes
+     * expiry across nodes and entries, preventing simultaneous mass
+     * verification storms in large non-hub topologies.
+     *
+     * @param rng  Uniform random variable (typically shared with RoutingProtocol)
+     */
+    void SetJitterRng(Ptr<UniformRandomVariable> rng);
+
+    /**
      * @brief Set the soft-expiry threshold ratio.
      *
      * @param ratio Value in [0.0, 1.0].  Soft expiry fires at
@@ -440,6 +453,24 @@ class GlobalTopologyTable
      * - 0.75 = near-OLSR (early soft expiry, faster convergence)
      */
     double m_softExpiryThreshold;
+
+    /**
+     * @brief Optional RNG for TTL jitter (desynchronization).
+     *
+     * When non-null, each TTL assignment adds uniform(0, effectiveTtl/6)
+     * jitter.  This spreads expiry across ~50s (at 300s TTL) so that
+     * CheckGttExpiry never faces a synchronized mass-expiry wave.
+     */
+    Ptr<UniformRandomVariable> m_jitterRng;
+
+    /**
+     * @brief Compute jittered TTL from base TTL.
+     *
+     * @param baseTtl  The effective TTL before jitter
+     * @return baseTtl + uniform(0, baseTtl/6) if m_jitterRng is set,
+     *         otherwise baseTtl unchanged
+     */
+    Time JitteredTtl(Time baseTtl) const;
 };
 
 } // namespace tavrn

@@ -902,7 +902,9 @@ RunSingleSimulation(const std::string& protocol,
                     uint32_t churnNodes,
                     double churnInterval,
                     bool hubTraffic,
-                    bool verbose)
+                    double hubFailTime,
+                    bool verbose,
+                    uint32_t mtu = 0)
 {
     RunResult result{};
 
@@ -978,6 +980,15 @@ RunSingleSimulation(const std::string& protocol,
                                  UintegerValue(0));
 
     NetDeviceContainer wifiDevices = wifi.Install(wifiPhy, wifiMac, nodes);
+
+    // Constrained MTU — simulates IoT link layers (BLE ~230B, LoRa ~250B, 802.15.4 ~100B)
+    if (mtu > 0)
+    {
+        for (uint32_t i = 0; i < wifiDevices.GetN(); ++i)
+        {
+            wifiDevices.Get(i)->SetMtu(static_cast<uint16_t>(mtu));
+        }
+    }
 
     // -------------------------------------------------------------------------
     // Mobility — scenario-based
@@ -1410,21 +1421,28 @@ RunSingleSimulation(const std::string& protocol,
     ApplicationContainer sinkApps;
     ApplicationContainer sourceApps;
 
+    // Hub failover: determine if hub-bound flows need two phases
+    bool doHubFailover = hubTraffic && hubFailTime > 0.0 && hubFailTime < simTime;
+    uint32_t oldHubIdx = 0;
+    uint32_t newHubIdx = 1;
+
     for (uint32_t f = 0; f < actualFlows; ++f)
     {
         uint32_t srcIdx;
         uint32_t dstIdx;
+        bool isHubBound = false;
 
         if (hubTraffic)
         {
-            // Mixed hub traffic: first half of flows → node 0 (sensors→hub),
+            // Mixed hub traffic: first half of flows → hub (sensors→hub),
             // second half = peer-to-peer (switch→light, etc.)
             if (f < actualFlows / 2 + actualFlows % 2)
             {
-                // Hub-bound: source is node f+1 (skip hub=0), destination is 0
+                // Hub-bound: source is node f+1 (skip hub=0), destination is hub
                 srcIdx = f + 1;
                 if (srcIdx >= nNodes) srcIdx = nNodes - 1;
-                dstIdx = 0;
+                dstIdx = oldHubIdx;
+                isHubBound = true;
             }
             else
             {
@@ -1452,6 +1470,7 @@ RunSingleSimulation(const std::string& protocol,
             }
         }
 
+        // --- Phase 1 sink + source (always installed) ---
         PacketSinkHelper sinkHelper("ns3::UdpSocketFactory",
                                     InetSocketAddress(Ipv4Address::GetAny(), appPort + f));
         ApplicationContainer sinkApp = sinkHelper.Install(nodes.Get(dstIdx));
@@ -1459,12 +1478,13 @@ RunSingleSimulation(const std::string& protocol,
         sinkApp.Stop(Seconds(simTime));
         sinkApps.Add(sinkApp);
 
-        OnOffHelper onOffHelper(
-            "ns3::UdpSocketFactory",
-            InetSocketAddress(interfaces.GetAddress(dstIdx), appPort + f));
         std::ostringstream onTimeStr, offTimeStr;
         onTimeStr << "ns3::ConstantRandomVariable[Constant=" << onTime << "]";
         offTimeStr << "ns3::ConstantRandomVariable[Constant=" << offTime << "]";
+
+        OnOffHelper onOffHelper(
+            "ns3::UdpSocketFactory",
+            InetSocketAddress(interfaces.GetAddress(dstIdx), appPort + f));
         onOffHelper.SetAttribute("OnTime", StringValue(onTimeStr.str()));
         onOffHelper.SetAttribute("OffTime", StringValue(offTimeStr.str()));
         onOffHelper.SetAttribute("PacketSize", UintegerValue(packetSize));
@@ -1473,8 +1493,53 @@ RunSingleSimulation(const std::string& protocol,
         double stagger = static_cast<double>(f) * 0.5;
         ApplicationContainer srcApp = onOffHelper.Install(nodes.Get(srcIdx));
         srcApp.Start(Seconds(appStartBase + stagger));
-        srcApp.Stop(Seconds(simTime - 1.0));
+
+        if (doHubFailover && isHubBound)
+        {
+            // Phase 1: stop source at hubFailTime (hub about to die)
+            srcApp.Stop(Seconds(hubFailTime));
+        }
+        else
+        {
+            srcApp.Stop(Seconds(simTime - 1.0));
+        }
         sourceApps.Add(srcApp);
+
+        // --- Phase 2: hub failover — redirect hub-bound flows to node 1 ---
+        if (doHubFailover && isHubBound)
+        {
+            // Skip if source IS the new hub (can't send to self)
+            if (srcIdx != newHubIdx)
+            {
+                // Sink on new hub for this port
+                ApplicationContainer sink2 = sinkHelper.Install(nodes.Get(newHubIdx));
+                sink2.Start(Seconds(0.0));
+                sink2.Stop(Seconds(simTime));
+                sinkApps.Add(sink2);
+
+                // Phase 2 source: same sensor → new hub (node 1)
+                OnOffHelper onOff2(
+                    "ns3::UdpSocketFactory",
+                    InetSocketAddress(interfaces.GetAddress(newHubIdx), appPort + f));
+                onOff2.SetAttribute("OnTime", StringValue(onTimeStr.str()));
+                onOff2.SetAttribute("OffTime", StringValue(offTimeStr.str()));
+                onOff2.SetAttribute("PacketSize", UintegerValue(packetSize));
+                onOff2.SetAttribute("DataRate", StringValue(dataRateStr.str()));
+
+                ApplicationContainer src2 = onOff2.Install(nodes.Get(srcIdx));
+                src2.Start(Seconds(hubFailTime));
+                src2.Stop(Seconds(simTime - 1.0));
+                sourceApps.Add(src2);
+            }
+        }
+    }
+
+    // --- Schedule hub failure (L3 down — consistent with existing failNodes) ---
+    if (doHubFailover)
+    {
+        Ptr<Ipv4> hubIpv4 = nodes.Get(oldHubIdx)->GetObject<Ipv4>();
+        Simulator::Schedule(Seconds(hubFailTime),
+                            &Ipv4::SetDown, hubIpv4, static_cast<uint32_t>(1));
     }
 
     // -------------------------------------------------------------------------
@@ -1803,7 +1868,9 @@ main(int argc, char* argv[])
     uint32_t churnNodes = 0;  // number of nodes in rolling churn pool
     double churnInterval = 60.0; // seconds between churn rotations
     bool hubTraffic = false;  // mixed hub traffic: half flows → node 0, half peer-to-peer
+    double hubFailTime = 0.0; // time to fail hub (node 0) and redirect to node 1 (0=disabled)
     double sampleInterval = 0.0; // temporal sampling interval (s), 0 = disabled
+    uint32_t mtu = 0;           // 0 = default (2296), otherwise constrained MTU in bytes
 
     CommandLine cmd(__FILE__);
     cmd.AddValue("protocol", "Routing protocol: TAVRN, AODV, AODV-Tuned, OLSR, OLSR-Tuned, DSDV", protocol);
@@ -1828,7 +1895,9 @@ main(int argc, char* argv[])
     cmd.AddValue("churnNodes", "Rolling churn: nodes cycling offline per interval", churnNodes);
     cmd.AddValue("churnInterval", "Rolling churn: seconds between rotations", churnInterval);
     cmd.AddValue("hubTraffic", "Mixed hub traffic: half flows to node 0, half peer-to-peer", hubTraffic);
+    cmd.AddValue("hubFailTime", "Time to fail hub node 0 and redirect traffic to node 1 (0=disabled)", hubFailTime);
     cmd.AddValue("sampleInterval", "Temporal sampling interval in seconds (0=disabled)", sampleInterval);
+    cmd.AddValue("mtu", "Constrained MTU in bytes (0=default 2296)", mtu);
     cmd.Parse(argc, argv);
 
     // Set global sampling interval
@@ -1920,8 +1989,10 @@ main(int argc, char* argv[])
                                            offTime,
                                            churnNodes,
                                            churnInterval,
-                                           hubTraffic,
-                                           verbose);
+                                            hubTraffic,
+                                            hubFailTime,
+                                            verbose,
+                                            mtu);
 
         allPdr.push_back(r.pdr);
         allLatency.push_back(r.avgLatencyMs);

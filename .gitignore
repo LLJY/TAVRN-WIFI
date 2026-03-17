@@ -26,3 +26,6 @@ __pycache__/
 # Temporary files
 *.tmp
 *.bak
+
+# Results (large binary/data files — keep in local storage, not git)
+results/

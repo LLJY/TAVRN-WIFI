@@ -266,15 +266,15 @@ struct ERerrHeaderTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(h.RemoveUnDestination(un), true, "trivial");
         NS_TEST_EXPECT_MSG_EQ(h.GetDestCount(), 1, "One entry removed");
 
-        // Verify variable-length serialization: 1 + 3*N bytes (compressed)
+        // Verify variable-length serialization: 2 + 3*N bytes (compressed, 2B flags with 3-bit AM)
         ERerrHeader h3;
-        NS_TEST_EXPECT_MSG_EQ(h3.GetSerializedSize(), 1, "Empty RERR is 1 byte (compressed)");
+        NS_TEST_EXPECT_MSG_EQ(h3.GetSerializedSize(), 2, "Empty RERR is 2 bytes (compressed)");
         h3.AddUnDestination(Ipv4Address("10.1.1.1"), 1);
-        NS_TEST_EXPECT_MSG_EQ(h3.GetSerializedSize(), 4, "RERR with 1 dest is 1 + 3 = 4 bytes");
+        NS_TEST_EXPECT_MSG_EQ(h3.GetSerializedSize(), 5, "RERR with 1 dest is 2 + 3 = 5 bytes");
         h3.AddUnDestination(Ipv4Address("10.1.1.2"), 2);
         NS_TEST_EXPECT_MSG_EQ(h3.GetSerializedSize(),
-                              7,
-                              "RERR with 2 dests is 1 + 6 = 7 bytes");
+                              8,
+                              "RERR with 2 dests is 2 + 6 = 8 bytes");
 
         // Round-trip serialization
         Ptr<Packet> p = Create<Packet>();
@@ -359,7 +359,7 @@ struct SyncOfferHeaderTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(h.GetMenteeAddr(), Ipv4Address("10.1.1.99"), "trivial");
 
         // Verify serialized size: compressed 1B + 1B + 1B = 3
-        NS_TEST_EXPECT_MSG_EQ(h.GetSerializedSize(), 3, "SYNC_OFFER is 3 bytes (compressed)");
+        NS_TEST_EXPECT_MSG_EQ(h.GetSerializedSize(), 4, "SYNC_OFFER is 4 bytes (compressed, 1B AM)");
 
         // Test setters (use 10.1.1.x addresses)
         h.SetMentorAddr(Ipv4Address("10.1.1.2"));
@@ -374,7 +374,7 @@ struct SyncOfferHeaderTest : public TestCase
         p->AddHeader(h);
         SyncOfferHeader h2;
         uint32_t bytes = p->RemoveHeader(h2);
-        NS_TEST_EXPECT_MSG_EQ(bytes, 3, "SYNC_OFFER deserialized to 3 bytes");
+        NS_TEST_EXPECT_MSG_EQ(bytes, 4, "SYNC_OFFER deserialized to 4 bytes");
         NS_TEST_EXPECT_MSG_EQ(h2.GetMentorAddr(), Ipv4Address("10.1.1.2"), "trivial");
         NS_TEST_EXPECT_MSG_EQ(h2.GetGttSize(), 100, "trivial");
         NS_TEST_EXPECT_MSG_EQ(h2.GetMenteeAddr(), Ipv4Address("10.1.1.50"), "trivial");
@@ -571,14 +571,14 @@ struct TcUpdateHeaderTest : public TestCase
         NS_TEST_EXPECT_MSG_EQ(h.GetTimestamp(), 60000, "trivial");
 
         // Verify serialized size: compressed 1+2+1+1+2 = 7 bytes
-        NS_TEST_EXPECT_MSG_EQ(h.GetSerializedSize(), 7, "TC_UPDATE is 7 bytes (compressed)");
+        NS_TEST_EXPECT_MSG_EQ(h.GetSerializedSize(), 8, "TC_UPDATE is 8 bytes (compressed, 1B AM)");
 
         // Round-trip serialization
         Ptr<Packet> p = Create<Packet>();
         p->AddHeader(h);
         TcUpdateHeader h2;
         uint32_t bytes = p->RemoveHeader(h2);
-        NS_TEST_EXPECT_MSG_EQ(bytes, 7, "TC_UPDATE deserialized to 7 bytes");
+        NS_TEST_EXPECT_MSG_EQ(bytes, 8, "TC_UPDATE deserialized to 8 bytes");
         NS_TEST_EXPECT_MSG_EQ(h, h2, "Round trip serialization works");
     }
 };
@@ -635,7 +635,7 @@ struct TopologyMetadataHeaderTest : public TestCase
         // Test empty header
         TopologyMetadataHeader h;
         NS_TEST_EXPECT_MSG_EQ(h.GetEntryCount(), 0, "Empty header has 0 entries");
-        NS_TEST_EXPECT_MSG_EQ(h.GetSerializedSize(), 1, "Empty header is 1 byte (count only)");
+        NS_TEST_EXPECT_MSG_EQ(h.GetSerializedSize(), 2, "Empty header is 2 bytes (count + AM)");
 
         // Round-trip empty header
         {
@@ -643,7 +643,7 @@ struct TopologyMetadataHeaderTest : public TestCase
             p->AddHeader(h);
             TopologyMetadataHeader h2;
             uint32_t bytes = p->RemoveHeader(h2);
-            NS_TEST_EXPECT_MSG_EQ(bytes, 1, "Empty metadata deserialized to 1 byte");
+            NS_TEST_EXPECT_MSG_EQ(bytes, 2, "Empty metadata deserialized to 2 bytes");
             NS_TEST_EXPECT_MSG_EQ(h2.GetEntryCount(), 0, "Empty after round trip");
         }
 
@@ -654,8 +654,8 @@ struct TopologyMetadataHeaderTest : public TestCase
         e1.flags = 0;
         h.AddEntry(e1);
         NS_TEST_EXPECT_MSG_EQ(h.GetEntryCount(), 1, "1 entry");
-        // Compressed: 1B count + 1 * 2B = 3
-        NS_TEST_EXPECT_MSG_EQ(h.GetSerializedSize(), 3, "1 entry = 3 bytes (compressed)");
+        // Compressed: 1B count + 1B AM + 1 * 2B = 4
+        NS_TEST_EXPECT_MSG_EQ(h.GetSerializedSize(), 4, "1 entry = 4 bytes (compressed, 1B AM)");
 
         // Test FLAG_FRESHNESS_REQUEST flag
         GttMetadataEntry e2;
@@ -677,8 +677,8 @@ struct TopologyMetadataHeaderTest : public TestCase
             h.AddEntry(e);
         }
         NS_TEST_EXPECT_MSG_EQ(h.GetEntryCount(), 5, "5 entries");
-        // Compressed: 1B count + 5 * 2B = 11
-        NS_TEST_EXPECT_MSG_EQ(h.GetSerializedSize(), 11, "5 entries = 11 bytes (compressed)");
+        // Compressed: 1B count + 1B AM + 5 * 2B = 12
+        NS_TEST_EXPECT_MSG_EQ(h.GetSerializedSize(), 12, "5 entries = 12 bytes (compressed, 1B AM)");
 
         // Round-trip with 5 entries
         {
@@ -686,7 +686,7 @@ struct TopologyMetadataHeaderTest : public TestCase
             p->AddHeader(h);
             TopologyMetadataHeader h2;
             uint32_t bytes = p->RemoveHeader(h2);
-            NS_TEST_EXPECT_MSG_EQ(bytes, 11, "5-entry metadata deserialized to 11 bytes");
+            NS_TEST_EXPECT_MSG_EQ(bytes, 12, "5-entry metadata deserialized to 12 bytes");
             NS_TEST_EXPECT_MSG_EQ(h2.GetEntryCount(), 5, "5 entries after round trip");
 
             const auto& entries = h2.GetEntries();
